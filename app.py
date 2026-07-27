@@ -20,11 +20,14 @@ from supabase_auth import (
 )
 from monitor_jobs_service import (
     MonitorJobError,
+    activate_monitor_job_test,
     create_monitor_job,
     delete_monitor_job,
     format_job_datetime,
+    get_worker_health,
     list_monitor_jobs,
-    update_monitor_job_status,
+    pause_monitor_job,
+    reset_monitor_job,
 )
 from tago_api import TagoAPIError, TagoClient
 from telegram_link import (
@@ -207,7 +210,7 @@ except SupabaseAuthError as exc:
 # 6. 로그인 화면
 # =========================================================
 st.title("🚄 KTX 빈자리 모니터")
-st.caption("6B 단계 · 사용자별 모니터링 작업 저장 및 관리")
+st.caption("7A 단계 · 백그라운드 Worker 실행 테스트")
 
 if auth_user is None:
     st.info(
@@ -508,10 +511,36 @@ else:
 
 
 # =========================================================
-# 9. 내 저장 작업
+# 9. 내 저장 작업 및 Worker 제어
 # =========================================================
 st.divider()
 st.subheader("② 내 저장 작업")
+
+try:
+    worker_health = get_worker_health(
+        supabase_client
+    )
+except MonitorJobError as exc:
+    st.warning(str(exc))
+    worker_health = {
+        "is_online": False,
+        "last_seen_at": None,
+        "worker_version": None,
+        "seconds_since_heartbeat": None,
+    }
+
+if worker_health.get("is_online") is True:
+    st.success(
+        "백그라운드 Worker 연결 정상"
+        f" · 버전 {worker_health.get('worker_version') or '-'}"
+        f" · 최근 신호 "
+        f"{worker_health.get('seconds_since_heartbeat') or 0}초 전"
+    )
+else:
+    st.warning(
+        "백그라운드 Worker가 아직 연결되지 않았거나 "
+        "최근 45초 동안 신호가 없습니다."
+    )
 
 try:
     saved_jobs = list_monitor_jobs(
@@ -524,7 +553,7 @@ except MonitorJobError as exc:
 
 STATUS_LABELS = {
     "draft": "준비",
-    "active": "실행 중",
+    "active": "백그라운드 실행 중",
     "paused": "일시정지",
     "completed": "완료",
     "error": "오류",
@@ -534,6 +563,12 @@ SEAT_CLASS_LABELS = {
     "general": "일반실",
     "special": "특실",
     "any": "일반실 또는 특실",
+}
+
+RESULT_LABELS = {
+    "simulation_sold_out": "연습용 매진",
+    "simulation_available": "연습용 빈자리 발견",
+    "train_departed": "열차 출발시간 경과",
 }
 
 if not saved_jobs:
@@ -569,6 +604,13 @@ else:
                 "간격": (
                     f"{job.get('check_interval_seconds', '-')}초"
                 ),
+                "조회": (
+                    f"{job.get('worker_check_count', 0)}회"
+                ),
+                "최근 결과": RESULT_LABELS.get(
+                    str(job.get("last_result", "")),
+                    str(job.get("last_result") or "-"),
+                ),
             }
         )
 
@@ -600,7 +642,7 @@ else:
             f" · "
             f"{format_job_datetime(job_by_id[job_id].get('departure_planned_at'))}"
         ),
-        key="saved_job_selector",
+        key="saved_job_selector_step7a",
     )
 
     selected_saved_job = job_by_id[
@@ -610,47 +652,93 @@ else:
         selected_saved_job.get("status", "draft")
     )
 
-    manage_col1, manage_col2 = st.columns(2)
+    if selected_saved_job.get("last_error"):
+        st.error(
+            "최근 Worker 오류: "
+            f"{selected_saved_job.get('last_error')}"
+        )
 
-    with manage_col1:
-        if selected_saved_status == "paused":
+    simulation_available_after = st.selectbox(
+        "백그라운드 테스트 빈자리 발견 시점",
+        options=[2, 3, 5, 10],
+        index=1,
+        format_func=lambda count: f"{count}번째 조회",
+        disabled=(
+            selected_saved_status == "active"
+        ),
+        help=(
+            "실제 좌석정보가 아니라 Worker와 Telegram이 "
+            "정상 동작하는지 확인하기 위한 테스트 조건입니다."
+        ),
+    )
+
+    action_col1, action_col2, action_col3 = st.columns(3)
+
+    with action_col1:
+        if selected_saved_status == "active":
             if st.button(
-                "재개 준비 상태로 변경",
+                "백그라운드 일시정지",
                 use_container_width=True,
             ):
                 try:
-                    update_monitor_job_status(
+                    pause_monitor_job(
                         supabase_client,
-                        user_id=user_id,
                         job_id=selected_saved_job_id,
-                        status="draft",
-                    )
-                except MonitorJobError as exc:
-                    st.error(str(exc))
-                else:
-                    st.success(
-                        "작업을 준비 상태로 변경했습니다."
-                    )
-                    st.rerun()
-        else:
-            if st.button(
-                "작업 일시정지",
-                use_container_width=True,
-            ):
-                try:
-                    update_monitor_job_status(
-                        supabase_client,
-                        user_id=user_id,
-                        job_id=selected_saved_job_id,
-                        status="paused",
                     )
                 except MonitorJobError as exc:
                     st.error(str(exc))
                 else:
                     st.success("작업을 일시정지했습니다.")
                     st.rerun()
+        else:
+            if st.button(
+                "백그라운드 테스트 시작",
+                type="primary",
+                use_container_width=True,
+                disabled=(
+                    not st.session_state.telegram_chat_id
+                    or worker_health.get("is_online") is not True
+                ),
+            ):
+                try:
+                    activate_monitor_job_test(
+                        supabase_client,
+                        job_id=selected_saved_job_id,
+                        available_after_checks=(
+                            simulation_available_after
+                        ),
+                    )
+                except MonitorJobError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success(
+                        "백그라운드 테스트를 시작했습니다. "
+                        "이제 브라우저를 닫아도 Worker가 계속 실행합니다."
+                    )
+                    st.rerun()
 
-    with manage_col2:
+    with action_col2:
+        if st.button(
+            "준비 상태로 초기화",
+            use_container_width=True,
+            disabled=(
+                selected_saved_status == "active"
+            ),
+        ):
+            try:
+                reset_monitor_job(
+                    supabase_client,
+                    job_id=selected_saved_job_id,
+                )
+            except MonitorJobError as exc:
+                st.error(str(exc))
+            else:
+                st.success(
+                    "작업을 준비 상태로 초기화했습니다."
+                )
+                st.rerun()
+
+    with action_col3:
         delete_confirmed = st.checkbox(
             "삭제 확인",
             key=f"delete_confirm_{selected_saved_job_id}",
@@ -659,7 +747,10 @@ else:
         if st.button(
             "선택 작업 삭제",
             use_container_width=True,
-            disabled=not delete_confirmed,
+            disabled=(
+                not delete_confirmed
+                or selected_saved_status == "active"
+            ),
         ):
             try:
                 delete_monitor_job(
@@ -674,8 +765,8 @@ else:
                 st.rerun()
 
     st.caption(
-        "현재는 백그라운드 Worker가 연결되지 않아 준비·일시정지 "
-        "상태만 관리합니다. 저장 작업이 자동으로 좌석을 조회하지는 않습니다."
+        "현재 Worker는 실제 코레일 좌석이 아니라 연습용 상태를 조회합니다. "
+        "조회 간격은 저장한 3초 이상의 값을 그대로 사용합니다."
     )
 
 
@@ -1360,10 +1451,12 @@ with st.expander("현재 공개 서비스 준비 상태"):
         "- RLS로 다른 사용자의 프로필 접근 차단\n"
         "- 공식 열차 시간표 조회 적용\n"
         "- 사용자별 모니터링 작업 영구 저장\n"
-        "- 저장 작업 일시정지·재개 준비·삭제\n"
-        "- 최소 조회 간격 3초 적용\n\n"
-        "다음 단계에서는 저장 작업을 읽는 백그라운드 Worker 구조와 "
-        "실제 좌석정보 확보 가능성을 검증합니다."
+        "- 저장 작업 일시정지·초기화·삭제\n"
+        "- 최소 조회 간격 3초 적용\n"
+        "- Render 백그라운드 Worker 연결\n"
+        "- 브라우저 종료 후 Telegram 테스트 알림\n\n"
+        "다음 단계에서는 연습용 공급자를 실제 좌석정보 공급자로 "
+        "교체할 수 있는 합법적·안정적 방식을 검증합니다."
     )
 
 st.caption(

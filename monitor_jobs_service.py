@@ -17,19 +17,12 @@ ALLOWED_SEAT_CLASSES = {
     "any",
 }
 
-ALLOWED_USER_STATUSES = {
-    "draft",
-    "paused",
-}
-
 MIN_INTERVAL_SECONDS = 3
 MAX_INTERVAL_SECONDS = 3600
 KST = ZoneInfo("Asia/Seoul")
 
 
 def _to_kst_iso(value: str) -> str:
-    """화면의 YYYY-MM-DD HH:MM 값을 KST timestamptz 문자열로 변환합니다."""
-
     text = str(value).strip()
 
     try:
@@ -80,8 +73,11 @@ def list_monitor_jobs(
                 "travel_date,train_type,train_no,"
                 "departure_planned_at,arrival_planned_at,"
                 "seat_class,check_interval_seconds,is_enabled,"
+                "provider,simulation_available_after_checks,"
+                "worker_check_count,next_check_at,"
                 "last_checked_at,last_result,last_error,"
-                "alert_sent_at,created_at,updated_at"
+                "alert_sent_at,completed_reason,"
+                "worker_version,created_at,updated_at"
             )
             .eq("user_id", user_id)
             .order("created_at", desc=True)
@@ -90,7 +86,7 @@ def list_monitor_jobs(
     except Exception as exc:
         raise MonitorJobError(
             "저장된 모니터링 작업을 불러오지 못했습니다. "
-            "monitor_jobs 테이블과 RLS 정책을 확인하세요."
+            "Step 7A SQL과 RLS 설정을 확인하세요."
         ) from exc
 
     data = response.data or []
@@ -160,8 +156,6 @@ def create_monitor_job(
         ),
         "seat_class": seat_class,
         "check_interval_seconds": interval,
-        # Worker 연결 전에는 절대 자동 실행하지 않습니다.
-        "is_enabled": False,
     }
 
     try:
@@ -189,8 +183,8 @@ def create_monitor_job(
             or "23514" in message
         ):
             raise MonitorJobError(
-                "Supabase의 조회 간격 제한이 아직 3초로 변경되지 않았습니다. "
-                "Step 6B SQL 패치를 먼저 실행하세요."
+                "조회 간격 제한을 확인하세요. "
+                "저장 가능한 범위는 3초 이상 3,600초 이하입니다."
             ) from exc
 
         raise MonitorJobError(
@@ -205,36 +199,102 @@ def create_monitor_job(
     return payload
 
 
-def update_monitor_job_status(
+def activate_monitor_job_test(
     client: Client,
     *,
-    user_id: str,
     job_id: str,
-    status: str,
+    available_after_checks: int,
 ) -> None:
-    if status not in ALLOWED_USER_STATUSES:
-        raise MonitorJobError(
-            "사용자가 변경할 수 없는 작업 상태입니다."
-        )
-
     try:
-        (
-            client.table("monitor_jobs")
-            .update(
-                {
-                    "status": status,
-                    # Worker 연결 전에는 항상 비활성 상태를 유지합니다.
-                    "is_enabled": False,
-                }
-            )
-            .eq("id", job_id)
-            .eq("user_id", user_id)
-            .execute()
-        )
+        client.rpc(
+            "activate_monitor_job_test",
+            {
+                "p_job_id": job_id,
+                "p_available_after": int(
+                    available_after_checks
+                ),
+            },
+        ).execute()
     except Exception as exc:
         raise MonitorJobError(
-            "모니터링 작업 상태를 변경하지 못했습니다."
+            _friendly_rpc_error(
+                exc,
+                "백그라운드 테스트를 시작하지 못했습니다.",
+            )
         ) from exc
+
+
+def pause_monitor_job(
+    client: Client,
+    *,
+    job_id: str,
+) -> None:
+    try:
+        client.rpc(
+            "pause_monitor_job",
+            {
+                "p_job_id": job_id,
+            },
+        ).execute()
+    except Exception as exc:
+        raise MonitorJobError(
+            _friendly_rpc_error(
+                exc,
+                "작업을 일시정지하지 못했습니다.",
+            )
+        ) from exc
+
+
+def reset_monitor_job(
+    client: Client,
+    *,
+    job_id: str,
+) -> None:
+    try:
+        client.rpc(
+            "reset_monitor_job",
+            {
+                "p_job_id": job_id,
+            },
+        ).execute()
+    except Exception as exc:
+        raise MonitorJobError(
+            _friendly_rpc_error(
+                exc,
+                "작업을 준비 상태로 초기화하지 못했습니다.",
+            )
+        ) from exc
+
+
+def get_worker_health(
+    client: Client,
+) -> dict[str, Any]:
+    try:
+        response = client.rpc(
+            "get_worker_health",
+        ).execute()
+    except Exception as exc:
+        raise MonitorJobError(
+            "Worker 상태를 확인하지 못했습니다. "
+            "Step 7A SQL을 먼저 실행하세요."
+        ) from exc
+
+    rows = response.data or []
+
+    if isinstance(rows, list) and rows:
+        row = rows[0]
+        if isinstance(row, dict):
+            return row
+
+    if isinstance(rows, dict):
+        return rows
+
+    return {
+        "is_online": False,
+        "last_seen_at": None,
+        "worker_version": None,
+        "seconds_since_heartbeat": None,
+    }
 
 
 def delete_monitor_job(
@@ -255,3 +315,40 @@ def delete_monitor_job(
         raise MonitorJobError(
             "모니터링 작업을 삭제하지 못했습니다."
         ) from exc
+
+
+def _friendly_rpc_error(
+    exc: Exception,
+    fallback: str,
+) -> str:
+    message = str(exc)
+    lowered = message.lower()
+
+    mappings = (
+        (
+            "telegram 연결이 필요",
+            "먼저 본인의 Telegram을 연결하세요.",
+        ),
+        (
+            "already departed",
+            "이미 출발한 열차는 시작할 수 없습니다.",
+        ),
+        (
+            "이미 출발",
+            "이미 출발한 열차는 시작할 수 없습니다.",
+        ),
+        (
+            "로그인이 필요",
+            "로그인이 만료됐습니다. 다시 로그인하세요.",
+        ),
+        (
+            "작업을 찾지 못",
+            "작업을 찾지 못했거나 더 이상 실행할 수 없습니다.",
+        ),
+    )
+
+    for keyword, friendly in mappings:
+        if keyword in lowered:
+            return friendly
+
+    return f"{fallback} {message}"

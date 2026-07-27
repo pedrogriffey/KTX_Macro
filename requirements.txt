@@ -1,3 +1,4 @@
+# Force clean Streamlit rebuild: TAGO patch 4.2.1
 streamlit==1.60.0
 pandas>=2.2,<3
 requests>=2.32,<3

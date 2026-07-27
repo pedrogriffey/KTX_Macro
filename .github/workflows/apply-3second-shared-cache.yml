@@ -1,0 +1,354 @@
+name: Apply 3-second shared-cache monitoring
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/apply-3second-shared-cache.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-patch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Apply 3-second shared-cache patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_required(text: str, old: str, new: str, label: str) -> str:
+              if old not in text:
+                  raise RuntimeError(f"Patch target not found: {label}")
+              return text.replace(old, new, 1)
+
+          # -------------------------------------------------
+          # app.py
+          # -------------------------------------------------
+          app_path = Path("app.py")
+          app = app_path.read_text(encoding="utf-8")
+
+          app = replace_required(
+              app,
+              'st.caption("10A 단계 · 코레일 공개페이지 잔여석 확인")',
+              'st.caption("10A.2 단계 · 3초 모니터링과 열차별 공유 캐시")',
+              "app version caption",
+          )
+
+          app = replace_required(
+              app,
+              '''        if selected_interval < 30:\n            st.warning(\n                "현재 작업은 30초보다 짧아 실제 페이지 확인을 시작할 수 없습니다. "\n                "30초 이상 조회 간격의 작업을 새로 저장하세요."\n            )\n\n''',
+              '''        if selected_interval < 30:\n            st.info(\n                "3초 모니터링으로 실행됩니다. 코레일 공개페이지의 실제 새 조회는 "\n                "동일 열차끼리 공유하며 최대 30초에 한 번 수행합니다."\n            )\n\n''',
+              "short interval warning",
+          )
+
+          app = replace_required(
+              app,
+              '''                or worker_health.get("is_online") is not True\n                or selected_interval < 30\n''',
+              '''                or worker_health.get("is_online") is not True\n''',
+              "live button disabled interval",
+          )
+
+          app = replace_required(
+              app,
+              '''        "실제 잔여석 확인은 코레일 공개 예매페이지를 최소 30초 간격으로 "\n        "확인합니다. 연습용 테스트는 3초부터 가능합니다."\n''',
+              '''        "작업은 3초부터 실행할 수 있습니다. 동일 열차의 코레일 공개페이지 "\n        "새 조회는 30초 공유 캐시를 사용해 중복 접속을 줄입니다."\n''',
+              "saved job caption",
+          )
+
+          app = app.replace(
+              '''                "3~15초는 연습용 테스트에 사용할 수 있습니다. "\n                "실제 코레일 페이지 모니터링은 30초 이상 간격의 작업만 가능합니다."\n''',
+              '''                "실제 잔여석 모니터링도 3초부터 시작할 수 있습니다. "\n                "다만 같은 열차의 코레일 페이지 새 조회는 30초 공유 캐시를 사용합니다."\n''',
+              1,
+          )
+
+          app = app.replace(
+              '''        "- 실제 페이지 최소 조회 간격 30초\\n"\n        "- 사용자당 실제 활성 작업 최대 1개\\n"\n''',
+              '''        "- 사용자 작업 실행 간격 최소 3초\\n"\n        "- 동일 열차 코레일 페이지 결과 30초 공유 캐시\\n"\n        "- 사용자당 실제 활성 작업 최대 1개\\n"\n''',
+              1,
+          )
+
+          app_path.write_text(app, encoding="utf-8")
+
+          # -------------------------------------------------
+          # monitor_jobs_service.py
+          # -------------------------------------------------
+          service_path = Path("monitor_jobs_service.py")
+          service = service_path.read_text(encoding="utf-8")
+          service = service.replace(
+              "실제 코레일 페이지 조회는 30초 이상 작업만 시작할 수 있습니다.",
+              "실제 코레일 페이지 모니터링은 3초 이상 작업부터 시작할 수 있습니다.",
+          )
+          service_path.write_text(service, encoding="utf-8")
+
+          # -------------------------------------------------
+          # worker.py
+          # -------------------------------------------------
+          worker_path = Path("worker.py")
+          worker = worker_path.read_text(encoding="utf-8")
+
+          worker = replace_required(
+              worker,
+              'WORKER_VERSION = "10A.1-no9A"',
+              'WORKER_VERSION = "10A.2-no9A"',
+              "worker version",
+          )
+
+          worker = replace_required(
+              worker,
+              '''    minimum_interval = (\n        30\n        if str(job.get("provider") or "") == "korail_web"\n        else 3\n    )\n\n''',
+              '''    minimum_interval = 3\n\n''',
+              "worker minimum interval",
+          )
+
+          worker_path.write_text(worker, encoding="utf-8")
+
+          # -------------------------------------------------
+          # korail_web_provider.py
+          # -------------------------------------------------
+          provider_path = Path("korail_web_provider.py")
+          provider = provider_path.read_text(encoding="utf-8")
+
+          provider = replace_required(
+              provider,
+              '''import os\nimport re\nfrom typing import Any, Iterable\n''',
+              '''import os\nimport re\nimport threading\nimport time\nfrom typing import Any, Iterable\n''',
+              "provider imports",
+          )
+
+          provider = replace_required(
+              provider,
+              '''KST = ZoneInfo("Asia/Seoul")\n\n\nclass KorailWebSeatProvider:\n''',
+              '''KST = ZoneInfo("Asia/Seoul")\n\n_CACHE_LOCK = threading.Lock()\n_RESULT_CACHE: dict[\n    tuple[str, str, str, str, str, str],\n    tuple[float, SeatCheckResult],\n] = {}\n\n\nclass KorailWebSeatProvider:\n''',
+              "provider cache globals",
+          )
+
+          provider = replace_required(
+              provider,
+              '''        self.timeout_ms = max(\n            10_000,\n            min(\n                int(\n                    os.getenv(\n                        "KORAIL_BROWSER_TIMEOUT_MS",\n                        "30000",\n                    )\n                ),\n                90_000,\n            ),\n        )\n''',
+              '''        self.timeout_ms = max(\n            10_000,\n            min(\n                int(\n                    os.getenv(\n                        "KORAIL_BROWSER_TIMEOUT_MS",\n                        "30000",\n                    )\n                ),\n                90_000,\n            ),\n        )\n\n        self.shared_cache_seconds = max(\n            3,\n            min(\n                int(\n                    os.getenv(\n                        "KORAIL_SHARED_CACHE_SECONDS",\n                        "30",\n                    )\n                ),\n                300,\n            ),\n        )\n''',
+              "provider cache config",
+          )
+
+          provider = replace_required(
+              provider,
+              '''        next_count = int(\n            job.get("worker_check_count") or 0\n        ) + 1\n\n        try:\n            with sync_playwright() as playwright:\n                browser = playwright.chromium.launch(\n                    headless=True,\n                    args=["--disable-dev-shm-usage"],\n                )\n\n                try:\n                    return self._check_with_browser(\n                        browser=browser,\n                        job=job,\n                        next_count=next_count,\n                    )\n                finally:\n                    browser.close()\n''',
+              '''        next_count = int(\n            job.get("worker_check_count") or 0\n        ) + 1\n\n        cache_key = self._cache_key(job)\n        now_monotonic = time.monotonic()\n\n        with _CACHE_LOCK:\n            cached = _RESULT_CACHE.get(cache_key)\n\n        if cached is not None:\n            cached_at, cached_result = cached\n            cache_age = now_monotonic - cached_at\n\n            if cache_age < self.shared_cache_seconds:\n                return SeatCheckResult(\n                    availability=cached_result.availability,\n                    result_code=cached_result.result_code,\n                    detail=(\n                        f"{cached_result.detail} "\n                        f"(열차별 공유 캐시 {cache_age:.1f}초)"\n                    ),\n                    next_check_count=next_count,\n                    provider_name=self.name,\n                    observed_at=cached_result.observed_at,\n                )\n\n        try:\n            with sync_playwright() as playwright:\n                browser = playwright.chromium.launch(\n                    headless=True,\n                    args=["--disable-dev-shm-usage"],\n                )\n\n                try:\n                    result = self._check_with_browser(\n                        browser=browser,\n                        job=job,\n                        next_count=next_count,\n                    )\n                finally:\n                    browser.close()\n\n            with _CACHE_LOCK:\n                _RESULT_CACHE[cache_key] = (\n                    time.monotonic(),\n                    result,\n                )\n\n            return result\n''',
+              "provider check cache",
+          )
+
+          provider = replace_required(
+              provider,
+              '''    def _fill_station(\n''',
+              '''    @staticmethod\n    def _cache_key(\n        job: dict[str, Any],\n    ) -> tuple[str, str, str, str, str, str]:\n        return (\n            str(job.get("departure_station_id") or ""),\n            str(job.get("arrival_station_id") or ""),\n            str(job.get("travel_date") or ""),\n            str(job.get("train_no") or ""),\n            str(job.get("departure_planned_at") or ""),\n            str(job.get("seat_class") or "any"),\n        )\n\n    def _fill_station(\n''',
+              "provider cache key",
+          )
+
+          provider_path.write_text(provider, encoding="utf-8")
+
+          # -------------------------------------------------
+          # render.yaml
+          # -------------------------------------------------
+          render_path = Path("render.yaml")
+          render_text = render_path.read_text(encoding="utf-8")
+
+          if "KORAIL_SHARED_CACHE_SECONDS" not in render_text:
+              render_text = replace_required(
+                  render_text,
+                  '''      - key: KORAIL_BROWSER_TIMEOUT_MS\n        value: "30000"\n''',
+                  '''      - key: KORAIL_BROWSER_TIMEOUT_MS\n        value: "30000"\n      - key: KORAIL_SHARED_CACHE_SECONDS\n        value: "30"\n''',
+                  "render cache env",
+              )
+
+          render_path.write_text(render_text, encoding="utf-8")
+
+          # -------------------------------------------------
+          # Supabase migration SQL
+          # -------------------------------------------------
+          sql = r'''-- =========================================================
+          -- KTX 빈자리 모니터 Step 10A.2
+          -- 사용자 작업 3초 허용 + 동일 열차 결과 공유 캐시
+          -- =========================================================
+
+          create or replace function public.activate_monitor_job_live(
+              p_job_id uuid
+          )
+          returns public.monitor_jobs
+          language plpgsql
+          security definer
+          set search_path = ''
+          as $$
+          declare
+              current_user_id uuid;
+              total_active_count integer;
+              live_active_count integer;
+              result_row public.monitor_jobs;
+          begin
+              current_user_id := (select auth.uid());
+
+              if current_user_id is null then
+                  raise exception '로그인이 필요합니다.';
+              end if;
+
+              if not exists (
+                  select 1
+                  from public.profiles
+                  where id = current_user_id
+                    and telegram_chat_id is not null
+                    and length(trim(telegram_chat_id)) > 0
+              ) then
+                  raise exception 'Telegram 연결이 필요합니다.';
+              end if;
+
+              if not exists (
+                  select 1
+                  from public.monitor_jobs
+                  where id = p_job_id
+                    and user_id = current_user_id
+                    and check_interval_seconds >= 3
+              ) then
+                  raise exception '실제 페이지 모니터링 간격은 3초 이상이어야 합니다.';
+              end if;
+
+              select count(*)
+              into total_active_count
+              from public.monitor_jobs
+              where user_id = current_user_id
+                and status = 'active'
+                and is_enabled = true
+                and id <> p_job_id;
+
+              if total_active_count >= 3 then
+                  raise exception '동시에 실행 가능한 작업은 최대 3개입니다.';
+              end if;
+
+              select count(*)
+              into live_active_count
+              from public.monitor_jobs
+              where user_id = current_user_id
+                and status = 'active'
+                and is_enabled = true
+                and provider = 'korail_web'
+                and id <> p_job_id;
+
+              if live_active_count >= 1 then
+                  raise exception '실제 좌석 작업은 최대 1개만 동시에 실행할 수 있습니다.';
+              end if;
+
+              update public.monitor_jobs
+              set
+                  status = 'active',
+                  is_enabled = true,
+                  provider = 'korail_web',
+                  worker_check_count = 0,
+                  next_check_at = now(),
+                  locked_at = null,
+                  lock_token = null,
+                  last_checked_at = null,
+                  last_result = null,
+                  last_error = null,
+                  alert_sent_at = null,
+                  completed_reason = null,
+                  worker_version = null
+              where id = p_job_id
+                and user_id = current_user_id
+                and departure_planned_at > now()
+              returning * into result_row;
+
+              if result_row.id is null then
+                  raise exception '작업을 찾지 못했거나 이미 출발한 열차입니다.';
+              end if;
+
+              return result_row;
+          end;
+          $$;
+
+          revoke all on function public.activate_monitor_job_live(uuid)
+          from public, anon;
+
+          grant execute on function public.activate_monitor_job_live(uuid)
+          to authenticated;
+
+          select
+              routine_name
+          from information_schema.routines
+          where routine_schema = 'public'
+            and routine_name = 'activate_monitor_job_live';
+          '''
+
+          sql = "\n".join(
+              line[10:] if line.startswith("          ") else line
+              for line in sql.splitlines()
+          )
+
+          Path("supabase_step10a2_3second_shared_cache.sql").write_text(
+              sql.strip() + "\n",
+              encoding="utf-8",
+          )
+
+          readme = '''# Step 10A.2 — 3초 모니터링 + 열차별 공유 캐시
+
+          - 사용자가 저장한 3초 작업으로 실제 모니터링 시작 가능
+          - Worker는 작업을 3초 간격으로 처리
+          - 동일 열차·구간·좌석조건의 코레일 페이지 결과를 기본 30초 공유
+          - 같은 열차를 여러 사용자가 등록해도 브라우저 중복 실행 감소
+
+          적용 순서:
+
+          1. Supabase SQL Editor에서 `supabase_step10a2_3second_shared_cache.sql` 실행
+          2. Render Docker Worker 최신 Commit 배포
+          3. Worker 버전 `10A.2-no9A` 확인
+          4. Streamlit Reboot
+          5. 조회 간격 3초 작업 저장 후 실제 잔여석 모니터링 시작
+
+          Render 환경변수 기본값:
+
+          `KORAIL_SHARED_CACHE_SECONDS=30`
+          '''
+
+          readme = "\n".join(
+              line[10:] if line.startswith("          ") else line
+              for line in readme.splitlines()
+          )
+
+          Path("README_STEP10A2.md").write_text(
+              readme.strip() + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Validate Python syntax
+        run: |
+          python -m py_compile \
+            app.py \
+            worker.py \
+            monitor_jobs_service.py \
+            korail_web_provider.py
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            app.py \
+            worker.py \
+            monitor_jobs_service.py \
+            korail_web_provider.py \
+            render.yaml \
+            supabase_step10a2_3second_shared_cache.sql \
+            README_STEP10A2.md
+
+          if git diff --cached --quiet; then
+            echo "No change was needed."
+          else
+            git commit -m "Enable 3-second monitoring with shared cache"
+            git push
+          fi

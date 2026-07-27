@@ -1,7 +1,6 @@
-# KTX Seat Monitor Step 5B
+# KTX Seat Monitor Step 6B
 streamlit==1.60.0
 pandas>=2.2,<3
 requests>=2.32,<3
-# 2.18.1+ uses the internal package name supabase_auth,
-# which conflicts with the current local module supabase_auth.py.
+# 로컬 supabase_auth.py와 최신 내부 패키지의 이름 충돌 방지
 supabase==2.17.0

@@ -18,6 +18,14 @@ from supabase_auth import (
     sign_out,
     sign_up_with_password,
 )
+from monitor_jobs_service import (
+    MonitorJobError,
+    create_monitor_job,
+    delete_monitor_job,
+    format_job_datetime,
+    list_monitor_jobs,
+    update_monitor_job_status,
+)
 from tago_api import TagoAPIError, TagoClient
 from telegram_link import (
     TelegramError,
@@ -54,7 +62,7 @@ def initialize_state() -> None:
         "monitor_check_count": 0,
         "monitor_started_at": None,
         "monitor_next_check_at": None,
-        "monitor_interval": 5,
+        "monitor_interval": 3,
         "monitor_available_after": 3,
         "monitor_logs": [],
         "monitor_alert_sent": False,
@@ -199,7 +207,7 @@ except SupabaseAuthError as exc:
 # 6. 로그인 화면
 # =========================================================
 st.title("🚄 KTX 빈자리 모니터")
-st.caption("5B 단계 · 사용자 로그인 및 Telegram 연결 영구 저장")
+st.caption("6B 단계 · 사용자별 모니터링 작업 저장 및 관리")
 
 if auth_user is None:
     st.info(
@@ -498,8 +506,181 @@ else:
                     st.rerun()
 
 
+
 # =========================================================
-# 9. 모니터링 함수
+# 9. 내 저장 작업
+# =========================================================
+st.divider()
+st.subheader("② 내 저장 작업")
+
+try:
+    saved_jobs = list_monitor_jobs(
+        supabase_client,
+        user_id,
+    )
+except MonitorJobError as exc:
+    st.error(str(exc))
+    saved_jobs = []
+
+STATUS_LABELS = {
+    "draft": "준비",
+    "active": "실행 중",
+    "paused": "일시정지",
+    "completed": "완료",
+    "error": "오류",
+}
+
+SEAT_CLASS_LABELS = {
+    "general": "일반실",
+    "special": "특실",
+    "any": "일반실 또는 특실",
+}
+
+if not saved_jobs:
+    st.info(
+        "저장된 작업이 없습니다. 아래에서 공식 열차를 조회하고 "
+        "모니터링 작업을 저장하세요."
+    )
+else:
+    saved_job_rows = []
+
+    for job in saved_jobs:
+        saved_job_rows.append(
+            {
+                "상태": STATUS_LABELS.get(
+                    str(job.get("status", "")),
+                    str(job.get("status", "")),
+                ),
+                "구간": (
+                    f"{job.get('departure_station_name', '')}"
+                    f" → {job.get('arrival_station_name', '')}"
+                ),
+                "열차": (
+                    f"{job.get('train_type', '')} "
+                    f"{job.get('train_no', '')}"
+                ).strip(),
+                "출발": format_job_datetime(
+                    job.get("departure_planned_at")
+                ),
+                "좌석": SEAT_CLASS_LABELS.get(
+                    str(job.get("seat_class", "")),
+                    str(job.get("seat_class", "")),
+                ),
+                "간격": (
+                    f"{job.get('check_interval_seconds', '-')}초"
+                ),
+            }
+        )
+
+    st.dataframe(
+        pd.DataFrame(saved_job_rows),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    job_option_ids = [
+        str(job["id"])
+        for job in saved_jobs
+    ]
+    job_by_id = {
+        str(job["id"]): job
+        for job in saved_jobs
+    }
+
+    selected_saved_job_id = st.selectbox(
+        "관리할 작업 선택",
+        job_option_ids,
+        format_func=lambda job_id: (
+            f"{job_by_id[job_id].get('departure_station_name', '')}"
+            f" → "
+            f"{job_by_id[job_id].get('arrival_station_name', '')}"
+            f" · "
+            f"{job_by_id[job_id].get('train_type', '')} "
+            f"{job_by_id[job_id].get('train_no', '')}"
+            f" · "
+            f"{format_job_datetime(job_by_id[job_id].get('departure_planned_at'))}"
+        ),
+        key="saved_job_selector",
+    )
+
+    selected_saved_job = job_by_id[
+        selected_saved_job_id
+    ]
+    selected_saved_status = str(
+        selected_saved_job.get("status", "draft")
+    )
+
+    manage_col1, manage_col2 = st.columns(2)
+
+    with manage_col1:
+        if selected_saved_status == "paused":
+            if st.button(
+                "재개 준비 상태로 변경",
+                use_container_width=True,
+            ):
+                try:
+                    update_monitor_job_status(
+                        supabase_client,
+                        user_id=user_id,
+                        job_id=selected_saved_job_id,
+                        status="draft",
+                    )
+                except MonitorJobError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success(
+                        "작업을 준비 상태로 변경했습니다."
+                    )
+                    st.rerun()
+        else:
+            if st.button(
+                "작업 일시정지",
+                use_container_width=True,
+            ):
+                try:
+                    update_monitor_job_status(
+                        supabase_client,
+                        user_id=user_id,
+                        job_id=selected_saved_job_id,
+                        status="paused",
+                    )
+                except MonitorJobError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("작업을 일시정지했습니다.")
+                    st.rerun()
+
+    with manage_col2:
+        delete_confirmed = st.checkbox(
+            "삭제 확인",
+            key=f"delete_confirm_{selected_saved_job_id}",
+        )
+
+        if st.button(
+            "선택 작업 삭제",
+            use_container_width=True,
+            disabled=not delete_confirmed,
+        ):
+            try:
+                delete_monitor_job(
+                    supabase_client,
+                    user_id=user_id,
+                    job_id=selected_saved_job_id,
+                )
+            except MonitorJobError as exc:
+                st.error(str(exc))
+            else:
+                st.success("저장 작업을 삭제했습니다.")
+                st.rerun()
+
+    st.caption(
+        "현재는 백그라운드 Worker가 연결되지 않아 준비·일시정지 "
+        "상태만 관리합니다. 저장 작업이 자동으로 좌석을 조회하지는 않습니다."
+    )
+
+
+# =========================================================
+# 10. 모니터링 함수
 # =========================================================
 def append_monitor_log(
     check_count: int,
@@ -590,10 +771,10 @@ def build_alert_message(
 
 
 # =========================================================
-# 10. 공식 역 목록
+# 11. 공식 역 목록
 # =========================================================
 st.divider()
-st.subheader("② 공식 열차 조회")
+st.subheader("③ 공식 열차 조회")
 
 try:
     with st.spinner("공식 역 목록을 불러오는 중입니다..."):
@@ -749,8 +930,14 @@ if search_submitted:
 
                 st.session_state.official_trains = table_rows
                 st.session_state.search_summary = {
+                    "departure_station_id": (
+                        departure_station_id
+                    ),
                     "departure_station": (
                         departure_station["station_name"]
+                    ),
+                    "arrival_station_id": (
+                        arrival_station_id
                     ),
                     "arrival_station": (
                         arrival_station["station_name"]
@@ -765,13 +952,13 @@ if search_submitted:
 
 
 # =========================================================
-# 11. 열차 선택
+# 12. 열차 선택
 # =========================================================
 if st.session_state.official_trains is not None:
     summary = st.session_state.search_summary
 
     st.divider()
-    st.subheader("③ 모니터링할 열차 선택")
+    st.subheader("④ 모니터링할 열차 선택")
 
     st.write(
         f"**{summary['departure_station']} → "
@@ -842,41 +1029,134 @@ if st.session_state.official_trains is not None:
 
 
 # =========================================================
-# 12. 연습용 모니터링 설정
+# 13. 작업 저장 및 브라우저 테스트
 # =========================================================
 if st.session_state.selected_train:
     st.divider()
-    st.subheader("④ 빈자리 알림 흐름 테스트")
+    st.subheader("⑤ 모니터링 작업 저장")
+
+    selected_train = st.session_state.selected_train
+    summary = st.session_state.search_summary
+
+    st.write(
+        f"**{selected_train['열차종류']} "
+        f"{selected_train['열차번호']}** · "
+        f"{selected_train['출발일시']} 출발"
+    )
+
+    condition_col1, condition_col2 = st.columns(2)
+
+    with condition_col1:
+        seat_class = st.selectbox(
+            "좌석 조건",
+            options=["general", "special", "any"],
+            format_func=lambda value: {
+                "general": "일반실",
+                "special": "특실",
+                "any": "일반실 또는 특실",
+            }[value],
+        )
+
+    with condition_col2:
+        monitor_interval = st.selectbox(
+            "조회 간격",
+            options=[3, 5, 10, 15, 30, 60, 300],
+            index=1,
+            format_func=lambda value: (
+                f"{value}초"
+                if value < 60
+                else (
+                    "1분"
+                    if value == 60
+                    else f"{value // 60}분"
+                )
+            ),
+            disabled=st.session_state.monitor_active,
+            help=(
+                "저장 가능한 최소 조회 간격은 3초입니다. "
+                "실제 Worker 운영 시 서비스 부하와 외부 서비스 정책에 따라 "
+                "더 긴 간격이 적용될 수 있습니다."
+            ),
+        )
+
+    if not st.session_state.telegram_chat_id:
+        st.warning(
+            "알림을 받을 수 있도록 먼저 본인의 Telegram을 연결하세요."
+        )
+
+    if st.button(
+        "이 조건으로 모니터링 작업 저장",
+        type="primary",
+        use_container_width=True,
+        disabled=not st.session_state.telegram_chat_id,
+    ):
+        try:
+            create_monitor_job(
+                supabase_client,
+                user_id=user_id,
+                departure_station_id=summary[
+                    "departure_station_id"
+                ],
+                departure_station_name=summary[
+                    "departure_station"
+                ],
+                arrival_station_id=summary[
+                    "arrival_station_id"
+                ],
+                arrival_station_name=summary[
+                    "arrival_station"
+                ],
+                travel_date=summary["travel_date"],
+                train_type=str(
+                    selected_train["열차종류"]
+                ),
+                train_no=str(
+                    selected_train["열차번호"]
+                ),
+                departure_planned_at=str(
+                    selected_train["출발일시"]
+                ),
+                arrival_planned_at=str(
+                    selected_train["도착일시"]
+                ),
+                seat_class=seat_class,
+                check_interval_seconds=monitor_interval,
+            )
+        except MonitorJobError as exc:
+            st.error(str(exc))
+        else:
+            st.success(
+                "모니터링 작업을 저장했습니다. "
+                "내 저장 작업 목록에서 확인할 수 있습니다."
+            )
+            st.rerun()
+
+    st.caption(
+        "저장된 작업은 아직 자동 실행되지 않습니다. "
+        "백그라운드 Worker를 연결한 뒤 실제 실행 대상으로 전환합니다."
+    )
+
+    st.divider()
+    st.subheader("⑥ 브라우저 알림 흐름 테스트")
 
     st.warning(
         "선택한 열차번호와 시간표는 공식 데이터지만, "
         "좌석 발견은 아직 연습용 시뮬레이션입니다."
     )
 
-    monitor_col1, monitor_col2 = st.columns(2)
-
-    with monitor_col1:
-        monitor_interval = st.selectbox(
-            "조회 간격",
-            [5, 10, 15, 30],
-            format_func=lambda value: f"{value}초",
-            disabled=st.session_state.monitor_active,
-        )
-
-    with monitor_col2:
-        available_after = st.selectbox(
-            "연습용 빈자리 발견 시점",
-            [2, 3, 5, 10],
-            index=1,
-            format_func=lambda value: f"{value}번째 조회",
-            disabled=st.session_state.monitor_active,
-        )
+    available_after = st.selectbox(
+        "연습용 빈자리 발견 시점",
+        [2, 3, 5, 10],
+        index=1,
+        format_func=lambda value: f"{value}번째 조회",
+        disabled=st.session_state.monitor_active,
+    )
 
     start_col, stop_col, reset_col = st.columns(3)
 
     with start_col:
         if st.button(
-            "모니터링 시작",
+            "브라우저 테스트 시작",
             type="primary",
             use_container_width=True,
             disabled=st.session_state.monitor_active,
@@ -907,7 +1187,7 @@ if st.session_state.selected_train:
 
 
 # =========================================================
-# 13. 자동 모니터링 패널
+# 14. 자동 모니터링 패널
 # =========================================================
 @st.fragment(run_every="1s")
 def monitoring_panel() -> None:
@@ -918,7 +1198,7 @@ def monitoring_panel() -> None:
         return
 
     st.divider()
-    st.subheader("⑤ 모니터링 현황")
+    st.subheader("⑦ 브라우저 테스트 현황")
 
     now = datetime.now()
     next_check_at = (
@@ -1069,7 +1349,7 @@ monitoring_panel()
 
 
 # =========================================================
-# 14. 안내
+# 15. 안내
 # =========================================================
 st.divider()
 
@@ -1078,9 +1358,12 @@ with st.expander("현재 공개 서비스 준비 상태"):
         "- 사용자 이메일 회원가입·로그인 적용\n"
         "- 사용자별 Telegram 연결정보 영구 저장\n"
         "- RLS로 다른 사용자의 프로필 접근 차단\n"
-        "- 공식 열차 시간표 조회 적용\n\n"
-        "다음 단계에서는 모니터링 조건을 데이터베이스에 저장하고, "
-        "브라우저를 닫아도 실행되는 Worker 구조를 준비합니다."
+        "- 공식 열차 시간표 조회 적용\n"
+        "- 사용자별 모니터링 작업 영구 저장\n"
+        "- 저장 작업 일시정지·재개 준비·삭제\n"
+        "- 최소 조회 간격 3초 적용\n\n"
+        "다음 단계에서는 저장 작업을 읽는 백그라운드 Worker 구조와 "
+        "실제 좌석정보 확보 가능성을 검증합니다."
     )
 
 st.caption(

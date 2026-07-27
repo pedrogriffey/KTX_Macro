@@ -21,7 +21,7 @@ from worker_rest_client import (
 )
 
 
-WORKER_VERSION = "8A.1"
+WORKER_VERSION = "8A.2"
 STOP_REQUESTED = False
 
 
@@ -544,7 +544,6 @@ def main() -> int:
             try:
                 process_job(
                     api=api,
-                    provider=provider,
                     bot_token=bot_token,
                     worker_id=worker_id,
                     job=job,

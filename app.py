@@ -8,6 +8,16 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from supabase_auth import (
+    SupabaseAuthError,
+    clear_telegram_profile,
+    ensure_profile,
+    restore_authenticated_client,
+    save_telegram_profile,
+    sign_in_with_password,
+    sign_out,
+    sign_up_with_password,
+)
 from tago_api import TagoAPIError, TagoClient
 from telegram_link import (
     TelegramError,
@@ -28,17 +38,14 @@ st.set_page_config(
 
 
 # =========================================================
-# 2. Session State 초기화
-#
-# Streamlit의 Session State는 방문자 세션별로 분리됩니다.
-# 따라서 다른 사용자의 열차 선택값이나 Telegram Chat ID와 섞이지 않습니다.
-# 다만 새로고침/세션 종료 후에는 초기화됩니다.
+# 2. Session State
 # =========================================================
 def initialize_state() -> None:
     defaults: dict[str, Any] = {
         "telegram_link_code": secrets.token_urlsafe(12).replace("-", "_"),
         "telegram_chat_id": "",
         "telegram_display_name": "",
+        "profile_loaded_user_id": "",
         "official_trains": None,
         "search_summary": None,
         "selected_train": None,
@@ -61,6 +68,32 @@ def initialize_state() -> None:
             st.session_state[key] = value
 
 
+def clear_user_runtime_state() -> None:
+    for key in (
+        "telegram_chat_id",
+        "telegram_display_name",
+        "profile_loaded_user_id",
+        "official_trains",
+        "search_summary",
+        "selected_train",
+        "monitor_active",
+        "monitor_status",
+        "monitor_check_count",
+        "monitor_started_at",
+        "monitor_next_check_at",
+        "monitor_logs",
+        "monitor_alert_sent",
+        "monitor_last_error",
+        "monitor_train",
+    ):
+        st.session_state.pop(key, None)
+
+    st.session_state.telegram_link_code = (
+        secrets.token_urlsafe(12).replace("-", "_")
+    )
+    initialize_state()
+
+
 initialize_state()
 
 
@@ -81,13 +114,42 @@ def get_secret(name: str, default: str = "") -> str:
 
 DATA_GO_KR_SERVICE_KEY = get_secret("DATA_GO_KR_SERVICE_KEY")
 TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN")
+SUPABASE_URL = get_secret("SUPABASE_URL")
+SUPABASE_PUBLISHABLE_KEY = get_secret(
+    "SUPABASE_PUBLISHABLE_KEY"
+)
+
+missing_secrets = [
+    name
+    for name, value in (
+        ("DATA_GO_KR_SERVICE_KEY", DATA_GO_KR_SERVICE_KEY),
+        ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
+        ("SUPABASE_URL", SUPABASE_URL),
+        (
+            "SUPABASE_PUBLISHABLE_KEY",
+            SUPABASE_PUBLISHABLE_KEY,
+        ),
+    )
+    if not value
+]
+
+if missing_secrets:
+    st.error(
+        "Streamlit Secrets에 다음 값이 필요합니다: "
+        + ", ".join(missing_secrets)
+    )
+    st.code(
+        'DATA_GO_KR_SERVICE_KEY = "공공데이터 인증키"\n'
+        'TELEGRAM_BOT_TOKEN = "Telegram Bot Token"\n'
+        'SUPABASE_URL = "https://프로젝트ID.supabase.co"\n'
+        'SUPABASE_PUBLISHABLE_KEY = "sb_publishable_..."',
+        language="toml",
+    )
+    st.stop()
 
 
 # =========================================================
-# 4. 공식 데이터 캐시
-#
-# 역 목록은 모든 사용자에게 동일한 공개 데이터이므로 하루 동안 공유 캐시합니다.
-# 시간표는 동일 구간/날짜 요청을 60초 동안 공유해 API 호출량을 줄입니다.
+# 4. 캐시
 # =========================================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_official_stations(
@@ -120,7 +182,324 @@ def load_bot_profile(
 
 
 # =========================================================
-# 5. 모니터링 함수
+# 5. 인증 세션 복원
+# =========================================================
+try:
+    supabase_client, auth_user = restore_authenticated_client(
+        SUPABASE_URL,
+        SUPABASE_PUBLISHABLE_KEY,
+        st.session_state,
+    )
+except SupabaseAuthError as exc:
+    st.error(str(exc))
+    st.stop()
+
+
+# =========================================================
+# 6. 로그인 화면
+# =========================================================
+st.title("🚄 KTX 빈자리 모니터")
+st.caption("5B 단계 · 사용자 로그인 및 Telegram 연결 영구 저장")
+
+if auth_user is None:
+    st.info(
+        "계정을 만들거나 로그인해야 열차 조회와 알림 기능을 사용할 수 있습니다."
+    )
+
+    login_tab, signup_tab = st.tabs(
+        ["로그인", "회원가입"]
+    )
+
+    with login_tab:
+        with st.form("login_form"):
+            login_email = st.text_input(
+                "이메일",
+                placeholder="name@example.com",
+            )
+            login_password = st.text_input(
+                "비밀번호",
+                type="password",
+            )
+            login_submitted = st.form_submit_button(
+                "로그인",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if login_submitted:
+            if not login_email.strip() or not login_password:
+                st.error("이메일과 비밀번호를 모두 입력하세요.")
+            else:
+                try:
+                    client, user = sign_in_with_password(
+                        SUPABASE_URL,
+                        SUPABASE_PUBLISHABLE_KEY,
+                        st.session_state,
+                        login_email,
+                        login_password,
+                    )
+                    ensure_profile(
+                        client,
+                        user["id"],
+                        user["email"],
+                    )
+                except SupabaseAuthError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("로그인했습니다.")
+                    st.rerun()
+
+    with signup_tab:
+        with st.form("signup_form"):
+            signup_email = st.text_input(
+                "가입 이메일",
+                placeholder="name@example.com",
+            )
+            signup_password = st.text_input(
+                "가입 비밀번호",
+                type="password",
+                help="8자 이상을 권장합니다.",
+            )
+            signup_password_confirm = st.text_input(
+                "비밀번호 확인",
+                type="password",
+            )
+            signup_submitted = st.form_submit_button(
+                "회원가입",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if signup_submitted:
+            email = signup_email.strip()
+            password = signup_password
+
+            if not email or not password:
+                st.error("이메일과 비밀번호를 모두 입력하세요.")
+            elif len(password) < 8:
+                st.error("비밀번호는 8자 이상으로 입력하세요.")
+            elif password != signup_password_confirm:
+                st.error("비밀번호 확인이 일치하지 않습니다.")
+            else:
+                try:
+                    client, user, confirmation_required = (
+                        sign_up_with_password(
+                            SUPABASE_URL,
+                            SUPABASE_PUBLISHABLE_KEY,
+                            st.session_state,
+                            email,
+                            password,
+                        )
+                    )
+
+                    if not confirmation_required and user:
+                        ensure_profile(
+                            client,
+                            user["id"],
+                            user["email"],
+                        )
+                except SupabaseAuthError as exc:
+                    st.error(str(exc))
+                else:
+                    if confirmation_required:
+                        st.success(
+                            "회원가입 요청이 완료됐습니다. "
+                            "이메일 인증 후 로그인하세요."
+                        )
+                    else:
+                        st.success(
+                            "회원가입과 로그인이 완료됐습니다."
+                        )
+                        st.rerun()
+
+    st.caption(
+        "비밀번호는 앱이 직접 저장하지 않으며 Supabase Auth가 처리합니다."
+    )
+    st.stop()
+
+
+# =========================================================
+# 7. 로그인 사용자 프로필
+# =========================================================
+user_id = auth_user["id"]
+user_email = auth_user["email"]
+
+try:
+    profile = ensure_profile(
+        supabase_client,
+        user_id,
+        user_email,
+    )
+except SupabaseAuthError as exc:
+    st.error(str(exc))
+    st.stop()
+
+if st.session_state.profile_loaded_user_id != user_id:
+    st.session_state.telegram_chat_id = str(
+        profile.get("telegram_chat_id") or ""
+    )
+    st.session_state.telegram_display_name = str(
+        profile.get("telegram_display_name") or ""
+    )
+    st.session_state.profile_loaded_user_id = user_id
+    st.session_state.telegram_link_code = (
+        secrets.token_urlsafe(12).replace("-", "_")
+    )
+
+account_col, logout_col = st.columns([3, 1])
+
+with account_col:
+    st.success(f"로그인 계정: {user_email}")
+
+with logout_col:
+    if st.button(
+        "로그아웃",
+        use_container_width=True,
+    ):
+        sign_out(
+            supabase_client,
+            st.session_state,
+        )
+        clear_user_runtime_state()
+        st.rerun()
+
+st.info(
+    "Telegram 연결정보는 현재 로그인한 사용자 프로필에 저장됩니다. "
+    "다음에 다시 로그인하면 자동으로 복원됩니다."
+)
+
+
+# =========================================================
+# 8. Telegram 연결
+# =========================================================
+st.subheader("① 내 텔레그램 연결")
+
+try:
+    bot_profile = load_bot_profile(TELEGRAM_BOT_TOKEN)
+    bot_username = str(
+        bot_profile.get("username", "")
+    ).strip()
+except TelegramError as exc:
+    st.error(str(exc))
+    st.stop()
+
+if not bot_username:
+    st.error("텔레그램 봇 사용자명을 확인하지 못했습니다.")
+    st.stop()
+
+if st.session_state.telegram_chat_id:
+    st.success(
+        "연결 완료: "
+        f"{st.session_state.telegram_display_name or 'Telegram 사용자'}"
+    )
+
+    telegram_test_col, telegram_clear_col = st.columns(2)
+
+    with telegram_test_col:
+        if st.button(
+            "테스트 메시지 보내기",
+            use_container_width=True,
+        ):
+            try:
+                send_message(
+                    TELEGRAM_BOT_TOKEN,
+                    st.session_state.telegram_chat_id,
+                    (
+                        "✅ KTX 빈자리 모니터 연결 완료\n\n"
+                        f"로그인 계정: {user_email}\n"
+                        "알림 연결정보가 사용자 계정에 저장돼 있습니다."
+                    ),
+                )
+                st.success("테스트 메시지를 보냈습니다.")
+            except TelegramError as exc:
+                st.error(str(exc))
+
+    with telegram_clear_col:
+        if st.button(
+            "텔레그램 연결 해제",
+            use_container_width=True,
+        ):
+            try:
+                clear_telegram_profile(
+                    supabase_client,
+                    user_id,
+                )
+            except SupabaseAuthError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state.telegram_chat_id = ""
+                st.session_state.telegram_display_name = ""
+                st.session_state.telegram_link_code = (
+                    secrets.token_urlsafe(12).replace("-", "_")
+                )
+                st.success("텔레그램 연결을 해제했습니다.")
+                st.rerun()
+else:
+    link_code = st.session_state.telegram_link_code
+    bot_link = (
+        f"https://t.me/{bot_username}"
+        f"?start={link_code}"
+    )
+
+    st.write(
+        "아래 버튼을 누르고 Telegram에서 **시작**을 누른 뒤, "
+        "앱으로 돌아와 연결 확인을 누르세요."
+    )
+
+    st.link_button(
+        "텔레그램에서 내 알림 연결하기",
+        bot_link,
+        use_container_width=True,
+        type="primary",
+    )
+
+    st.caption(
+        f"현재 로그인 세션의 일회용 연결코드: `{link_code}`"
+    )
+
+    if st.button(
+        "텔레그램 연결 확인",
+        use_container_width=True,
+    ):
+        try:
+            matched_chat = find_chat_by_link_code(
+                TELEGRAM_BOT_TOKEN,
+                link_code,
+            )
+        except TelegramError as exc:
+            st.error(str(exc))
+        else:
+            if matched_chat is None:
+                st.warning(
+                    "연결 메시지를 아직 찾지 못했습니다. "
+                    "Telegram에서 시작을 누른 뒤 다시 확인하세요."
+                )
+            else:
+                try:
+                    save_telegram_profile(
+                        supabase_client,
+                        user_id=user_id,
+                        email=user_email,
+                        chat_id=matched_chat["chat_id"],
+                        display_name=matched_chat["display_name"],
+                    )
+                except SupabaseAuthError as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state.telegram_chat_id = (
+                        matched_chat["chat_id"]
+                    )
+                    st.session_state.telegram_display_name = (
+                        matched_chat["display_name"]
+                    )
+                    st.success(
+                        "텔레그램 연결정보를 사용자 계정에 저장했습니다."
+                    )
+                    st.rerun()
+
+
+# =========================================================
+# 9. 모니터링 함수
 # =========================================================
 def append_monitor_log(
     check_count: int,
@@ -159,7 +538,7 @@ def start_monitoring(
     train = st.session_state.selected_train
 
     if not train:
-        st.error("먼저 모니터링할 열차 한 개를 선택하세요.")
+        st.error("모니터링할 열차를 한 개 선택하세요.")
         return
 
     if not st.session_state.telegram_chat_id:
@@ -206,169 +585,23 @@ def build_alert_message(
         f"도착: {train['도착일시']}\n"
         f"조회 횟수: {check_count}회\n\n"
         "열차와 시간은 TAGO 공식 운행 시간표입니다.\n"
-        "단, 빈자리 발견은 아직 연습용 시뮬레이션입니다."
+        "빈자리 발견은 아직 연습용 시뮬레이션입니다."
     )
 
 
 # =========================================================
-# 6. 상단 안내
-# =========================================================
-st.title("🚄 KTX 빈자리 모니터")
-st.caption("4단계 · 공식 열차 시간표 + 사용자별 텔레그램 연결")
-
-st.info(
-    "열차번호와 출도착 시간은 국토교통부 TAGO 공식 열차정보 API에서 "
-    "가져옵니다. 좌석 재고는 이 API가 제공하지 않으므로, "
-    "빈자리 발견 부분은 아직 연습용 시뮬레이션입니다."
-)
-
-with st.expander("여러 사람이 사용할 수 있도록 바뀐 점"):
-    st.write(
-        "- 열차 선택, 모니터링 상태와 Telegram Chat ID는 사용자 세션별로 분리됩니다.\n"
-        "- 서버에는 공공데이터 인증키와 하나의 텔레그램 봇 토큰만 저장합니다.\n"
-        "- 각 사용자는 고유 연결코드로 자신의 텔레그램을 연결합니다.\n"
-        "- 공식 역 목록과 시간표는 캐시해 API 사용량을 줄입니다.\n"
-        "- 아직 로그인과 데이터베이스가 없어 새로고침하면 사용자 연결이 초기화됩니다."
-    )
-
-
-# =========================================================
-# 7. 필수 서버 설정 확인
-# =========================================================
-missing_secrets = []
-
-if not DATA_GO_KR_SERVICE_KEY:
-    missing_secrets.append("DATA_GO_KR_SERVICE_KEY")
-
-if not TELEGRAM_BOT_TOKEN:
-    missing_secrets.append("TELEGRAM_BOT_TOKEN")
-
-if missing_secrets:
-    st.error(
-        "Streamlit Secrets에 다음 값이 필요합니다: "
-        + ", ".join(missing_secrets)
-    )
-    st.code(
-        'DATA_GO_KR_SERVICE_KEY = "공공데이터포털 일반 인증키(Decoding)"\n'
-        'TELEGRAM_BOT_TOKEN = "기존 BotFather 토큰"',
-        language="toml",
-    )
-    st.stop()
-
-
-# =========================================================
-# 8. 사용자별 텔레그램 연결
-# =========================================================
-st.subheader("① 내 텔레그램 연결")
-
-try:
-    bot_profile = load_bot_profile(TELEGRAM_BOT_TOKEN)
-    bot_username = str(bot_profile.get("username", "")).strip()
-except TelegramError as exc:
-    st.error(str(exc))
-    st.stop()
-
-if not bot_username:
-    st.error("텔레그램 봇 사용자명을 확인하지 못했습니다.")
-    st.stop()
-
-if st.session_state.telegram_chat_id:
-    st.success(
-        f"연결 완료: {st.session_state.telegram_display_name}"
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if st.button(
-            "테스트 메시지 보내기",
-            use_container_width=True,
-        ):
-            try:
-                send_message(
-                    TELEGRAM_BOT_TOKEN,
-                    st.session_state.telegram_chat_id,
-                    (
-                        "✅ KTX 빈자리 모니터 연결 완료\n\n"
-                        "이 브라우저 세션의 알림이 이 대화로 전송됩니다."
-                    ),
-                )
-                st.success("테스트 메시지를 보냈습니다.")
-            except TelegramError as exc:
-                st.error(str(exc))
-
-    with col2:
-        if st.button(
-            "연결 해제",
-            use_container_width=True,
-        ):
-            st.session_state.telegram_chat_id = ""
-            st.session_state.telegram_display_name = ""
-            st.session_state.telegram_link_code = (
-                secrets.token_urlsafe(12).replace("-", "_")
-            )
-            st.rerun()
-else:
-    link_code = st.session_state.telegram_link_code
-    bot_link = f"https://t.me/{bot_username}?start={link_code}"
-
-    st.write(
-        "아래 버튼을 누르고 텔레그램에서 **시작**을 누른 뒤, "
-        "다시 앱으로 돌아와 연결 확인을 누르세요."
-    )
-
-    st.link_button(
-        "텔레그램에서 내 알림 연결하기",
-        bot_link,
-        use_container_width=True,
-        type="primary",
-    )
-
-    st.caption(
-        f"현재 브라우저 전용 연결코드: `{link_code}`"
-    )
-
-    if st.button(
-        "텔레그램 연결 확인",
-        use_container_width=True,
-    ):
-        try:
-            matched_chat = find_chat_by_link_code(
-                TELEGRAM_BOT_TOKEN,
-                link_code,
-            )
-        except TelegramError as exc:
-            st.error(str(exc))
-        else:
-            if matched_chat is None:
-                st.warning(
-                    "아직 연결 메시지를 찾지 못했습니다. "
-                    "텔레그램에서 시작을 누른 뒤 다시 확인하세요."
-                )
-            else:
-                st.session_state.telegram_chat_id = matched_chat["chat_id"]
-                st.session_state.telegram_display_name = (
-                    matched_chat["display_name"]
-                )
-                st.success("본인의 텔레그램이 연결됐습니다.")
-                st.rerun()
-
-
-# =========================================================
-# 9. 공식 역 목록 로드
+# 10. 공식 역 목록
 # =========================================================
 st.divider()
 st.subheader("② 공식 열차 조회")
 
 try:
     with st.spinner("공식 역 목록을 불러오는 중입니다..."):
-        stations = load_official_stations(DATA_GO_KR_SERVICE_KEY)
+        stations = load_official_stations(
+            DATA_GO_KR_SERVICE_KEY
+        )
 except TagoAPIError as exc:
     st.error(str(exc))
-    st.info(
-        "공공데이터포털에서 TAGO 열차정보 활용신청이 승인됐는지, "
-        "Secrets에 일반 인증키(Decoding)를 넣었는지 확인하세요."
-    )
     st.stop()
 
 station_map = {
@@ -390,9 +623,9 @@ def find_station_default(name: str) -> int:
 
 
 with st.form("official_search_form"):
-    col1, col2 = st.columns(2)
+    station_col1, station_col2 = st.columns(2)
 
-    with col1:
+    with station_col1:
         departure_station_id = st.selectbox(
             "출발역",
             station_ids,
@@ -400,7 +633,7 @@ with st.form("official_search_form"):
             format_func=station_label,
         )
 
-    with col2:
+    with station_col2:
         arrival_station_id = st.selectbox(
             "도착역",
             station_ids,
@@ -424,7 +657,6 @@ with st.form("official_search_form"):
     ktx_only = st.checkbox(
         "KTX 계열만 표시",
         value=True,
-        help="KTX, KTX-산천, KTX-이음, KTX-청룡 등 이름에 KTX가 포함된 열차만 표시합니다.",
     )
 
     search_submitted = st.form_submit_button(
@@ -439,20 +671,30 @@ if search_submitted:
     if departure_station_id == arrival_station_id:
         st.error("출발역과 도착역은 서로 달라야 합니다.")
     else:
-        # 한 사용자가 버튼을 빠르게 반복 클릭하는 것을 제한합니다.
-        elapsed = time.monotonic() - st.session_state.last_search_monotonic
+        elapsed = (
+            time.monotonic()
+            - st.session_state.last_search_monotonic
+        )
 
         if elapsed < 3:
             st.warning("잠시 후 다시 조회하세요.")
         else:
-            st.session_state.last_search_monotonic = time.monotonic()
+            st.session_state.last_search_monotonic = (
+                time.monotonic()
+            )
             reset_monitoring()
 
-            departure_station = station_map[departure_station_id]
-            arrival_station = station_map[arrival_station_id]
+            departure_station = station_map[
+                departure_station_id
+            ]
+            arrival_station = station_map[
+                arrival_station_id
+            ]
 
             try:
-                with st.spinner("공식 열차 시간표를 조회하는 중입니다..."):
+                with st.spinner(
+                    "공식 열차 시간표를 조회하는 중입니다..."
+                ):
                     rows = load_official_timetable(
                         departure_station_id,
                         arrival_station_id,
@@ -473,6 +715,7 @@ if search_submitted:
                 ]
 
                 table_rows = []
+
                 for row in filtered_rows:
                     fare_text = (
                         f"{row['adult_fare']:,}원"
@@ -506,9 +749,15 @@ if search_submitted:
 
                 st.session_state.official_trains = table_rows
                 st.session_state.search_summary = {
-                    "departure_station": departure_station["station_name"],
-                    "arrival_station": arrival_station["station_name"],
-                    "travel_date": travel_date.strftime("%Y-%m-%d"),
+                    "departure_station": (
+                        departure_station["station_name"]
+                    ),
+                    "arrival_station": (
+                        arrival_station["station_name"]
+                    ),
+                    "travel_date": travel_date.strftime(
+                        "%Y-%m-%d"
+                    ),
                     "after_hour": after_hour,
                     "ktx_only": ktx_only,
                 }
@@ -516,7 +765,7 @@ if search_submitted:
 
 
 # =========================================================
-# 10. 공식 시간표 결과 및 열차 선택
+# 11. 열차 선택
 # =========================================================
 if st.session_state.official_trains is not None:
     summary = st.session_state.search_summary
@@ -533,11 +782,13 @@ if st.session_state.official_trains is not None:
 
     if not st.session_state.official_trains:
         st.warning(
-            "조건에 맞는 열차가 없습니다. KTX 계열만 표시를 해제하거나 "
-            "시간과 날짜를 변경해보세요."
+            "조건에 맞는 열차가 없습니다. "
+            "KTX 계열만 표시를 해제하거나 조건을 변경하세요."
         )
     else:
-        result_df = pd.DataFrame(st.session_state.official_trains)
+        result_df = pd.DataFrame(
+            st.session_state.official_trains
+        )
 
         edited_df = st.data_editor(
             result_df,
@@ -556,16 +807,19 @@ if st.session_state.official_trains is not None:
             column_config={
                 "선택": st.column_config.CheckboxColumn(
                     "선택",
-                    help="연습용 모니터링에 사용할 열차 한 개를 선택하세요.",
                 )
             },
-            key="official_train_table",
+            key="official_train_table_step5b",
         )
 
-        selected_rows = edited_df[edited_df["선택"] == True]
+        selected_rows = edited_df[
+            edited_df["선택"] == True
+        ]
 
         if st.session_state.monitor_active:
-            st.warning("모니터링 중에는 열차를 변경하지 마세요.")
+            st.warning(
+                "모니터링 중에는 열차를 변경하지 마세요."
+            )
         elif selected_rows.empty:
             st.session_state.selected_train = None
             st.warning("열차 한 개를 선택하세요.")
@@ -573,39 +827,43 @@ if st.session_state.official_trains is not None:
             st.session_state.selected_train = None
             st.warning("열차 한 개만 선택할 수 있습니다.")
         else:
-            selected_train = selected_rows.iloc[0].to_dict()
-            st.session_state.selected_train = selected_train
+            selected_train = (
+                selected_rows.iloc[0].to_dict()
+            )
+            st.session_state.selected_train = (
+                selected_train
+            )
             st.success(
-                f"선택 완료: {selected_train['열차종류']} "
+                f"선택 완료: "
+                f"{selected_train['열차종류']} "
                 f"{selected_train['열차번호']} · "
                 f"{selected_train['출발일시']}"
             )
 
 
 # =========================================================
-# 11. 연습용 좌석 모니터링
+# 12. 연습용 모니터링 설정
 # =========================================================
 if st.session_state.selected_train:
     st.divider()
     st.subheader("④ 빈자리 알림 흐름 테스트")
 
     st.warning(
-        "여기서 반복 확인하는 좌석 상태는 아직 가짜 데이터입니다. "
-        "선택한 열차번호와 운행시간만 공식 데이터입니다."
+        "선택한 열차번호와 시간표는 공식 데이터지만, "
+        "좌석 발견은 아직 연습용 시뮬레이션입니다."
     )
 
-    col1, col2 = st.columns(2)
+    monitor_col1, monitor_col2 = st.columns(2)
 
-    with col1:
+    with monitor_col1:
         monitor_interval = st.selectbox(
             "조회 간격",
             [5, 10, 15, 30],
-            index=0,
             format_func=lambda value: f"{value}초",
             disabled=st.session_state.monitor_active,
         )
 
-    with col2:
+    with monitor_col2:
         available_after = st.selectbox(
             "연습용 빈자리 발견 시점",
             [2, 3, 5, 10],
@@ -614,19 +872,22 @@ if st.session_state.selected_train:
             disabled=st.session_state.monitor_active,
         )
 
-    col1, col2, col3 = st.columns(3)
+    start_col, stop_col, reset_col = st.columns(3)
 
-    with col1:
+    with start_col:
         if st.button(
             "모니터링 시작",
             type="primary",
             use_container_width=True,
             disabled=st.session_state.monitor_active,
         ):
-            start_monitoring(monitor_interval, available_after)
+            start_monitoring(
+                monitor_interval,
+                available_after,
+            )
             st.rerun()
 
-    with col2:
+    with stop_col:
         if st.button(
             "중지",
             use_container_width=True,
@@ -635,7 +896,7 @@ if st.session_state.selected_train:
             stop_monitoring()
             st.rerun()
 
-    with col3:
+    with reset_col:
         if st.button(
             "결과 초기화",
             use_container_width=True,
@@ -646,7 +907,7 @@ if st.session_state.selected_train:
 
 
 # =========================================================
-# 12. 자동 반복 패널
+# 13. 자동 모니터링 패널
 # =========================================================
 @st.fragment(run_every="1s")
 def monitoring_panel() -> None:
@@ -660,17 +921,24 @@ def monitoring_panel() -> None:
     st.subheader("⑤ 모니터링 현황")
 
     now = datetime.now()
-    next_check_at = st.session_state.monitor_next_check_at
+    next_check_at = (
+        st.session_state.monitor_next_check_at
+    )
 
     if (
         st.session_state.monitor_active
         and next_check_at is not None
         and now >= next_check_at
     ):
-        check_count = st.session_state.monitor_check_count + 1
+        check_count = (
+            st.session_state.monitor_check_count + 1
+        )
         st.session_state.monitor_check_count = check_count
 
-        if check_count >= st.session_state.monitor_available_after:
+        if (
+            check_count
+            >= st.session_state.monitor_available_after
+        ):
             append_monitor_log(
                 check_count,
                 "빈자리 발견",
@@ -691,21 +959,25 @@ def monitoring_panel() -> None:
                     st.session_state.monitor_status = (
                         "빈자리 발견 · 알림 실패"
                     )
-                    st.session_state.monitor_last_error = str(exc)
+                    st.session_state.monitor_last_error = (
+                        str(exc)
+                    )
                     append_monitor_log(
                         check_count,
                         "알림 실패",
                         str(exc),
                     )
                 else:
-                    st.session_state.monitor_alert_sent = True
+                    st.session_state.monitor_alert_sent = (
+                        True
+                    )
                     st.session_state.monitor_status = (
                         "빈자리 발견 · 알림 완료"
                     )
                     append_monitor_log(
                         check_count,
                         "알림 성공",
-                        "이 사용자의 텔레그램으로 알림 전송",
+                        "현재 로그인 사용자의 Telegram으로 전송",
                     )
 
             st.session_state.monitor_active = False
@@ -716,18 +988,23 @@ def monitoring_panel() -> None:
                 "매진",
                 (
                     "연습용 좌석 확인 결과 매진 "
-                    f"({st.session_state.monitor_available_after}번째 조회에서 발견 예정)"
+                    f"({st.session_state.monitor_available_after}"
+                    "번째 조회에서 발견 예정)"
                 ),
             )
             st.session_state.monitor_next_check_at = (
                 now
                 + timedelta(
-                    seconds=st.session_state.monitor_interval
+                    seconds=(
+                        st.session_state.monitor_interval
+                    )
                 )
             )
 
     status = st.session_state.monitor_status
-    check_count = st.session_state.monitor_check_count
+    check_count = (
+        st.session_state.monitor_check_count
+    )
 
     elapsed_seconds = 0
     if st.session_state.monitor_started_at is not None:
@@ -744,7 +1021,8 @@ def monitoring_panel() -> None:
     countdown = "-"
     if (
         st.session_state.monitor_active
-        and st.session_state.monitor_next_check_at is not None
+        and st.session_state.monitor_next_check_at
+        is not None
     ):
         countdown_seconds = max(
             0,
@@ -758,28 +1036,30 @@ def monitoring_panel() -> None:
         )
         countdown = f"{countdown_seconds}초"
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("상태", status)
-    col2.metric("조회 횟수", f"{check_count}회")
-    col3.metric("다음 조회", countdown)
+    status_col, count_col, next_col = st.columns(3)
+    status_col.metric("상태", status)
+    count_col.metric("조회 횟수", f"{check_count}회")
+    next_col.metric("다음 조회", countdown)
 
     st.caption(f"경과시간: {elapsed_seconds}초")
 
     if status == "빈자리 발견 · 알림 완료":
         st.success(
-            "연습용 빈자리를 발견했고, 현재 사용자가 연결한 "
-            "텔레그램으로 알림을 보냈습니다."
+            "현재 로그인 사용자의 Telegram으로 "
+            "테스트 알림을 보냈습니다."
         )
     elif status == "빈자리 발견 · 알림 실패":
         st.error(st.session_state.monitor_last_error)
     elif st.session_state.monitor_active:
         st.info(
-            "모니터링 중입니다. 현재 단계에서는 브라우저를 열어둬야 합니다."
+            "현재 단계에서는 브라우저를 열어둬야 합니다."
         )
 
     if st.session_state.monitor_logs:
         st.dataframe(
-            pd.DataFrame(st.session_state.monitor_logs),
+            pd.DataFrame(
+                st.session_state.monitor_logs
+            ),
             hide_index=True,
             use_container_width=True,
         )
@@ -789,22 +1069,20 @@ monitoring_panel()
 
 
 # =========================================================
-# 13. 공개 서비스 전 남은 작업
+# 14. 안내
 # =========================================================
 st.divider()
 
-with st.expander("공개 서비스 출시 전 남은 필수 개발"):
+with st.expander("현재 공개 서비스 준비 상태"):
     st.write(
-        "1. Google 또는 이메일 로그인\n"
-        "2. Supabase에 사용자와 Telegram 연결정보 저장\n"
-        "3. 사용자별 모니터링 작업 DB 저장\n"
-        "4. 브라우저를 닫아도 실행되는 백그라운드 Worker\n"
-        "5. Telegram getUpdates를 Webhook 방식으로 교체\n"
-        "6. 호출 횟수 제한, 이용약관, 개인정보처리방침\n"
-        "7. 실제 좌석정보를 합법적으로 얻을 수 있는 방식 검증"
+        "- 사용자 이메일 회원가입·로그인 적용\n"
+        "- 사용자별 Telegram 연결정보 영구 저장\n"
+        "- RLS로 다른 사용자의 프로필 접근 차단\n"
+        "- 공식 열차 시간표 조회 적용\n\n"
+        "다음 단계에서는 모니터링 조건을 데이터베이스에 저장하고, "
+        "브라우저를 닫아도 실행되는 Worker 구조를 준비합니다."
     )
 
 st.caption(
-    "현재 버전은 공개 베타 준비 단계입니다. 공식 열차 시간표를 사용하지만 "
-    "실제 좌석 재고 조회와 자동 예매는 포함하지 않습니다."
+    "현재 실제 잔여좌석 조회 및 자동예매 기능은 포함하지 않습니다."
 )

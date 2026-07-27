@@ -352,3 +352,65 @@ def _friendly_rpc_error(
             return friendly
 
     return f"{fallback} {message}"
+
+
+def get_provider_status(
+    client: Client,
+) -> list[dict[str, Any]]:
+    try:
+        response = client.rpc(
+            "get_provider_status",
+        ).execute()
+    except Exception as exc:
+        raise MonitorJobError(
+            "좌석정보 공급자 상태를 확인하지 못했습니다. "
+            "Step 8A SQL을 먼저 실행하세요."
+        ) from exc
+
+    rows = response.data or []
+
+    if not isinstance(rows, list):
+        return []
+
+    return [
+        row
+        for row in rows
+        if isinstance(row, dict)
+    ]
+
+
+def list_monitor_events(
+    client: Client,
+    *,
+    user_id: str,
+    job_id: str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    try:
+        response = (
+            client.table("monitor_events")
+            .select(
+                "id,job_id,user_id,event_type,provider,"
+                "result_code,detail,created_at"
+            )
+            .eq("user_id", user_id)
+            .eq("job_id", job_id)
+            .order("created_at", desc=True)
+            .limit(max(1, min(int(limit), 100)))
+            .execute()
+        )
+    except Exception as exc:
+        raise MonitorJobError(
+            "작업 실행기록을 불러오지 못했습니다."
+        ) from exc
+
+    rows = response.data or []
+
+    if not isinstance(rows, list):
+        return []
+
+    return [
+        row
+        for row in rows
+        if isinstance(row, dict)
+    ]

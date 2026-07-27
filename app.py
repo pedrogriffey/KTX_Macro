@@ -24,7 +24,9 @@ from monitor_jobs_service import (
     create_monitor_job,
     delete_monitor_job,
     format_job_datetime,
+    get_provider_status,
     get_worker_health,
+    list_monitor_events,
     list_monitor_jobs,
     pause_monitor_job,
     reset_monitor_job,
@@ -210,7 +212,7 @@ except SupabaseAuthError as exc:
 # 6. 로그인 화면
 # =========================================================
 st.title("🚄 KTX 빈자리 모니터")
-st.caption("7A 단계 · 백그라운드 Worker 실행 테스트")
+st.caption("8A 단계 · 공식 좌석 공급자 준비 및 운영 안전장치")
 
 if auth_user is None:
     st.info(
@@ -381,9 +383,71 @@ st.info(
 
 
 # =========================================================
-# 8. Telegram 연결
+# 8. 좌석정보 공급자 상태
 # =========================================================
-st.subheader("① 내 텔레그램 연결")
+st.subheader("① 좌석정보 연결 상태")
+
+try:
+    provider_status_rows = get_provider_status(
+        supabase_client
+    )
+except MonitorJobError as exc:
+    st.warning(str(exc))
+    provider_status_rows = []
+
+provider_by_name = {
+    str(row.get("provider_name", "")): row
+    for row in provider_status_rows
+}
+
+simulation_status = provider_by_name.get(
+    "simulation",
+    {},
+)
+official_status = provider_by_name.get(
+    "korail_official",
+    {},
+)
+
+if simulation_status.get("is_enabled") is True:
+    st.success(
+        "연습용 시뮬레이션 공급자 사용 가능"
+    )
+
+if official_status.get("is_enabled") is True:
+    st.success(
+        "코레일 공식 잔여좌석 공급자 연결 완료"
+    )
+else:
+    st.warning(
+        "실제 코레일 잔여좌석 공급자는 아직 연결되지 않았습니다. "
+        "공식 API 또는 제휴 승인을 받은 뒤 활성화합니다."
+    )
+
+st.caption(
+    str(
+        official_status.get("public_message")
+        or "현재 실제 좌석 여부는 제공하지 않습니다."
+    )
+)
+
+st.link_button(
+    "코레일 공식 예매 페이지 열기",
+    "https://www.letskorail.com/",
+    use_container_width=True,
+)
+
+st.info(
+    "공개 서비스에서는 비공식 내부 API, 로그인 자동화, "
+    "CAPTCHA 우회 또는 반복 웹 스크래핑을 사용하지 않습니다. "
+    "3초 조회 간격은 현재 시뮬레이션 Worker 검증에만 적용됩니다."
+)
+
+
+# =========================================================
+# 9. Telegram 연결
+# =========================================================
+st.subheader("② 내 텔레그램 연결")
 
 try:
     bot_profile = load_bot_profile(TELEGRAM_BOT_TOKEN)
@@ -511,10 +575,10 @@ else:
 
 
 # =========================================================
-# 9. 내 저장 작업 및 Worker 제어
+# 10. 내 저장 작업 및 Worker 제어
 # =========================================================
 st.divider()
-st.subheader("② 내 저장 작업")
+st.subheader("③ 내 저장 작업")
 
 try:
     worker_health = get_worker_health(
@@ -604,6 +668,11 @@ else:
                 "간격": (
                     f"{job.get('check_interval_seconds', '-')}초"
                 ),
+                "공급자": (
+                    "연습용"
+                    if str(job.get("provider", "")) == "simulation"
+                    else str(job.get("provider") or "-")
+                ),
                 "조회": (
                     f"{job.get('worker_check_count', 0)}회"
                 ),
@@ -657,6 +726,17 @@ else:
             "최근 Worker 오류: "
             f"{selected_saved_job.get('last_error')}"
         )
+
+    active_job_count = sum(
+        1
+        for job in saved_jobs
+        if str(job.get("status", "")) == "active"
+    )
+
+    st.caption(
+        f"동시에 실행 가능한 작업: 사용자당 최대 3개 "
+        f"· 현재 {active_job_count}개 실행 중"
+    )
 
     simulation_available_after = st.selectbox(
         "백그라운드 테스트 빈자리 발견 시점",
@@ -769,9 +849,42 @@ else:
         "조회 간격은 저장한 3초 이상의 값을 그대로 사용합니다."
     )
 
+    try:
+        recent_events = list_monitor_events(
+            supabase_client,
+            user_id=user_id,
+            job_id=selected_saved_job_id,
+            limit=10,
+        )
+    except MonitorJobError as exc:
+        st.warning(str(exc))
+        recent_events = []
+
+    if recent_events:
+        with st.expander("최근 백그라운드 실행기록"):
+            event_rows = []
+
+            for event in recent_events:
+                event_rows.append(
+                    {
+                        "시각": format_job_datetime(
+                            event.get("created_at")
+                        ),
+                        "이벤트": event.get("event_type") or "-",
+                        "공급자": event.get("provider") or "-",
+                        "결과": event.get("result_code") or "-",
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(event_rows),
+                hide_index=True,
+                use_container_width=True,
+            )
+
 
 # =========================================================
-# 10. 모니터링 함수
+# 11. 모니터링 함수
 # =========================================================
 def append_monitor_log(
     check_count: int,
@@ -862,10 +975,10 @@ def build_alert_message(
 
 
 # =========================================================
-# 11. 공식 역 목록
+# 12. 공식 역 목록
 # =========================================================
 st.divider()
-st.subheader("③ 공식 열차 조회")
+st.subheader("④ 공식 열차 조회")
 
 try:
     with st.spinner("공식 역 목록을 불러오는 중입니다..."):
@@ -1043,13 +1156,13 @@ if search_submitted:
 
 
 # =========================================================
-# 12. 열차 선택
+# 13. 열차 선택
 # =========================================================
 if st.session_state.official_trains is not None:
     summary = st.session_state.search_summary
 
     st.divider()
-    st.subheader("④ 모니터링할 열차 선택")
+    st.subheader("⑤ 모니터링할 열차 선택")
 
     st.write(
         f"**{summary['departure_station']} → "
@@ -1120,11 +1233,11 @@ if st.session_state.official_trains is not None:
 
 
 # =========================================================
-# 13. 작업 저장 및 브라우저 테스트
+# 14. 작업 저장 및 브라우저 테스트
 # =========================================================
 if st.session_state.selected_train:
     st.divider()
-    st.subheader("⑤ 모니터링 작업 저장")
+    st.subheader("⑥ 모니터링 작업 저장")
 
     selected_train = st.session_state.selected_train
     summary = st.session_state.search_summary
@@ -1228,7 +1341,7 @@ if st.session_state.selected_train:
     )
 
     st.divider()
-    st.subheader("⑥ 브라우저 알림 흐름 테스트")
+    st.subheader("⑦ 브라우저 알림 흐름 테스트")
 
     st.warning(
         "선택한 열차번호와 시간표는 공식 데이터지만, "
@@ -1278,7 +1391,7 @@ if st.session_state.selected_train:
 
 
 # =========================================================
-# 14. 자동 모니터링 패널
+# 15. 자동 모니터링 패널
 # =========================================================
 @st.fragment(run_every="1s")
 def monitoring_panel() -> None:
@@ -1289,7 +1402,7 @@ def monitoring_panel() -> None:
         return
 
     st.divider()
-    st.subheader("⑦ 브라우저 테스트 현황")
+    st.subheader("⑧ 브라우저 테스트 현황")
 
     now = datetime.now()
     next_check_at = (
@@ -1440,7 +1553,7 @@ monitoring_panel()
 
 
 # =========================================================
-# 15. 안내
+# 16. 안내
 # =========================================================
 st.divider()
 
@@ -1454,9 +1567,13 @@ with st.expander("현재 공개 서비스 준비 상태"):
         "- 저장 작업 일시정지·초기화·삭제\n"
         "- 최소 조회 간격 3초 적용\n"
         "- Render 백그라운드 Worker 연결\n"
-        "- 브라우저 종료 후 Telegram 테스트 알림\n\n"
-        "다음 단계에서는 연습용 공급자를 실제 좌석정보 공급자로 "
-        "교체할 수 있는 합법적·안정적 방식을 검증합니다."
+        "- 브라우저 종료 후 Telegram 테스트 알림\n"
+        "- 좌석 공급자 교체형 구조\n"
+        "- 사용자당 활성 작업 최대 3개\n"
+        "- 백그라운드 실행 감사 로그\n"
+        "- 공식 좌석 API 승인 전 실제 공급자 비활성화\n\n"
+        "다음 단계는 코레일 또는 승인된 제휴사의 공식 잔여좌석 API "
+        "계약이 확보된 뒤 실제 공급자 구현을 진행합니다."
     )
 
 st.caption(

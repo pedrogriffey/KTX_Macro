@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
-
-@dataclass(frozen=True)
-class SeatCheckResult:
-    is_available: bool
-    result_code: str
-    detail: str
-    next_check_count: int
+from provider_contract import (
+    SeatAvailability,
+    SeatCheckResult,
+)
 
 
 class SimulationSeatProvider:
@@ -33,26 +30,24 @@ class SimulationSeatProvider:
             or 3
         )
 
-        is_available = (
-            next_count >= available_after
-        )
-
-        if is_available:
+        if next_count >= available_after:
             return SeatCheckResult(
-                is_available=True,
+                availability=SeatAvailability.AVAILABLE,
                 result_code="simulation_available",
-                detail=(
-                    "연습용 좌석 발견 조건이 충족됐습니다."
-                ),
+                detail="연습용 좌석 발견 조건이 충족됐습니다.",
                 next_check_count=next_count,
+                provider_name=self.name,
+                observed_at=datetime.now(timezone.utc),
             )
 
         return SeatCheckResult(
-            is_available=False,
+            availability=SeatAvailability.SOLD_OUT,
             result_code="simulation_sold_out",
             detail=(
                 f"연습용 매진 상태 "
                 f"({next_count}/{available_after}회)"
             ),
             next_check_count=next_count,
+            provider_name=self.name,
+            observed_at=datetime.now(timezone.utc),
         )

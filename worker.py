@@ -9,7 +9,11 @@ import time
 import uuid
 from typing import Any
 
-from simulation_provider import SimulationSeatProvider
+from provider_contract import (
+    SeatAvailability,
+    SeatProviderUnavailableError,
+)
+from provider_registry import get_provider
 from telegram_link import TelegramError, send_message
 from worker_rest_client import (
     SupabaseWorkerClient,
@@ -17,7 +21,7 @@ from worker_rest_client import (
 )
 
 
-WORKER_VERSION = "7A.1"
+WORKER_VERSION = "8A.1"
 STOP_REQUESTED = False
 
 
@@ -113,7 +117,6 @@ def build_alert_message(
 
 def process_job(
     api: SupabaseWorkerClient,
-    provider: SimulationSeatProvider,
     bot_token: str,
     worker_id: str,
     job: dict[str, Any],
@@ -195,10 +198,29 @@ def process_job(
         )
         return
 
+    provider = get_provider(
+        str(job.get("provider") or "simulation")
+    )
+
+    api.insert_monitor_event(
+        {
+            "job_id": job_id,
+            "user_id": str(job.get("user_id", "")),
+            "event_type": "check_started",
+            "provider": provider.name,
+            "detail": {
+                "worker_version": WORKER_VERSION,
+                "current_count": int(
+                    job.get("worker_check_count") or 0
+                ),
+            },
+        }
+    )
+
     result = provider.check(job)
     checked_at = utc_now()
 
-    if result.is_available:
+    if result.availability == SeatAvailability.AVAILABLE:
         send_message(
             bot_token,
             chat_id,
@@ -220,9 +242,7 @@ def process_job(
                 "last_checked_at": iso_utc(
                     checked_at
                 ),
-                "last_result": (
-                    result.result_code
-                ),
+                "last_result": result.result_code,
                 "last_error": None,
                 "alert_sent_at": iso_utc(
                     checked_at
@@ -237,9 +257,24 @@ def process_job(
             },
         )
 
+        api.insert_monitor_event(
+            {
+                "job_id": job_id,
+                "user_id": str(job.get("user_id", "")),
+                "event_type": "alert_sent",
+                "provider": result.provider_name,
+                "result_code": result.result_code,
+                "detail": {
+                    "check_count": result.next_check_count,
+                    "channel": "telegram",
+                },
+            }
+        )
+
         logging.info(
-            "시뮬레이션 알림 전송 완료: %s",
+            "좌석 알림 전송 완료: %s | provider=%s",
             job_id,
+            result.provider_name,
         )
         return
 
@@ -259,6 +294,20 @@ def process_job(
     next_check_at = (
         checked_at
         + timedelta(seconds=interval)
+    )
+
+    api.insert_monitor_event(
+        {
+            "job_id": job_id,
+            "user_id": str(job.get("user_id", "")),
+            "event_type": "check_completed",
+            "provider": result.provider_name,
+            "result_code": result.result_code,
+            "detail": {
+                "check_count": result.next_check_count,
+                "availability": result.availability.value,
+            },
+        }
     )
 
     api.update_job(
@@ -411,8 +460,6 @@ def main() -> int:
         supabase_url=supabase_url,
         secret_key=secret_key,
     )
-    provider = SimulationSeatProvider()
-
     last_heartbeat_at: datetime | None = None
 
     logging.info(
@@ -448,8 +495,8 @@ def main() -> int:
                             now
                         ),
                         "metadata": {
-                            "provider": (
-                                provider.name
+                            "provider_mode": (
+                                "registry"
                             ),
                             "poll_seconds": (
                                 poll_seconds
@@ -501,6 +548,36 @@ def main() -> int:
                     bot_token=bot_token,
                     worker_id=worker_id,
                     job=job,
+                )
+            except SeatProviderUnavailableError as exc:
+                logging.error(
+                    "공식 좌석 공급자 미연결: %s",
+                    job.get("id"),
+                )
+                try:
+                    api.insert_monitor_event(
+                        {
+                            "job_id": str(job.get("id", "")),
+                            "user_id": str(job.get("user_id", "")),
+                            "event_type": "provider_unavailable",
+                            "provider": str(
+                                job.get("provider") or ""
+                            ),
+                            "result_code": "provider_unavailable",
+                            "detail": {
+                                "message": str(exc),
+                            },
+                        }
+                    )
+                except WorkerAPIError:
+                    logging.exception(
+                        "공급자 오류 이벤트 저장 실패"
+                    )
+                mark_job_error(
+                    api,
+                    worker_id,
+                    job,
+                    exc,
                 )
             except (
                 WorkerAPIError,

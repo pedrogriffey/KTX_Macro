@@ -170,6 +170,26 @@ class SupabaseWorkerClient:
 
         self._decode_response(response)
 
+    def insert_monitor_event(
+        self,
+        payload: dict[str, Any],
+    ) -> None:
+        url = (
+            f"{self.supabase_url}"
+            "/rest/v1/monitor_events"
+        )
+
+        response = self.session.post(
+            url,
+            json=payload,
+            headers={
+                "Prefer": "return=minimal",
+            },
+            timeout=self.timeout,
+        )
+
+        self._decode_response(response)
+
     @staticmethod
     def _decode_response(
         response: requests.Response,

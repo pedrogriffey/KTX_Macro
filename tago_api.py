@@ -3,8 +3,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 from urllib.parse import unquote
+import xml.etree.ElementTree as ET
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 class TagoAPIError(RuntimeError):
@@ -12,18 +15,36 @@ class TagoAPIError(RuntimeError):
 
 
 class TagoClient:
-    """국토교통부 TAGO 열차정보 API의 최소 기능 클라이언트입니다."""
+    """국토교통부 TAGO 열차정보 API 클라이언트입니다."""
 
-    BASE_URL = "https://apis.data.go.kr/1613000/TrainInfoService1"
+    # 공식 공공데이터포털 명세의 현재 Base URL입니다.
+    BASE_URL = "https://apis.data.go.kr/1613000/TrainInfo"
 
     def __init__(self, service_key: str, timeout: int = 20) -> None:
-        # 공공데이터포털에서 Encoding 키를 복사했더라도 한 번 풀어서
-        # requests가 정상적으로 URL 인코딩하도록 합니다.
+        # Encoding 키를 붙여 넣은 경우에도 한 번 디코딩하여
+        # requests가 쿼리스트링을 정상 인코딩하도록 합니다.
         self.service_key = unquote(service_key.strip())
         self.timeout = timeout
 
         if not self.service_key:
             raise TagoAPIError("공공데이터포털 인증키가 비어 있습니다.")
+
+        retry = Retry(
+            total=2,
+            connect=2,
+            read=2,
+            status=2,
+            backoff_factor=0.6,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+            raise_on_status=False,
+        )
+
+        self.session = requests.Session()
+        self.session.mount(
+            "https://",
+            HTTPAdapter(max_retries=retry),
+        )
 
     def _request(
         self,
@@ -36,60 +57,155 @@ class TagoClient:
             "pageNo": 1,
             "numOfRows": 999,
         }
+
         if params:
             query.update(params)
 
         url = f"{self.BASE_URL}/{operation}"
 
         try:
-            response = requests.get(
+            response = self.session.get(
                 url,
                 params=query,
                 timeout=self.timeout,
             )
-            response.raise_for_status()
+        except requests.exceptions.ConnectTimeout as exc:
+            raise TagoAPIError(
+                "TAGO 서버 연결 시간이 초과됐습니다. 잠시 후 다시 시도하세요."
+            ) from exc
+        except requests.exceptions.ReadTimeout as exc:
+            raise TagoAPIError(
+                "TAGO 서버 응답 시간이 초과됐습니다. 잠시 후 다시 시도하세요."
+            ) from exc
+        except requests.exceptions.ConnectionError as exc:
+            raise TagoAPIError(
+                "TAGO 서버 주소에 연결하지 못했습니다. "
+                "인터넷 연결 또는 공공데이터 서버 상태를 확인하세요."
+            ) from exc
         except requests.RequestException as exc:
             raise TagoAPIError(
-                "TAGO 서버에 연결하지 못했습니다. 잠시 후 다시 시도하세요."
+                f"TAGO 요청 중 네트워크 오류가 발생했습니다: "
+                f"{type(exc).__name__}"
             ) from exc
+
+        # 잘못된 API 경로나 서버 장애를 인증키 오류와 구분합니다.
+        if response.status_code == 404:
+            raise TagoAPIError(
+                "TAGO API 경로를 찾지 못했습니다(HTTP 404). "
+                "앱 코드의 API 주소를 확인하세요."
+            )
+
+        if response.status_code == 429:
+            raise TagoAPIError(
+                "TAGO API 호출 한도를 초과했습니다(HTTP 429). "
+                "잠시 후 다시 시도하세요."
+            )
+
+        if response.status_code >= 500:
+            raise TagoAPIError(
+                f"TAGO 서버에서 오류가 발생했습니다"
+                f"(HTTP {response.status_code}). 잠시 후 다시 시도하세요."
+            )
+
+        if response.status_code >= 400:
+            error_message = self._extract_error_message(response.text)
+            raise TagoAPIError(
+                f"TAGO 요청이 거부됐습니다"
+                f"(HTTP {response.status_code}): {error_message}"
+            )
 
         try:
             data = response.json()
         except ValueError as exc:
-            # 인증키 오류 등은 XML 또는 일반 텍스트로 반환될 수 있습니다.
-            preview = response.text[:300]
-            if "SERVICE_KEY" in preview or "AUTH" in preview:
-                raise TagoAPIError(
-                    "공공데이터 인증키를 확인하세요. "
-                    "가능하면 일반 인증키(Decoding)를 등록하세요."
-                ) from exc
+            error_message = self._extract_error_message(response.text)
+
             raise TagoAPIError(
-                "TAGO 서버가 JSON이 아닌 응답을 반환했습니다."
+                "TAGO가 JSON이 아닌 응답을 반환했습니다: "
+                f"{error_message}"
             ) from exc
 
         response_root = data.get("response", {})
-        header = response_root.get("header", {})
-        result_code = str(header.get("resultCode", "")).strip()
-        result_message = str(header.get("resultMsg", "")).strip()
+        header = response_root.get("header", {}) or {}
+
+        result_code = str(
+            header.get("resultCode", "")
+        ).strip()
+        result_message = str(
+            header.get("resultMsg", "")
+        ).strip()
 
         if result_code not in {"00", "0", ""}:
             raise TagoAPIError(
-                f"TAGO API 오류: {result_message or result_code}"
+                f"TAGO API 오류 {result_code}: "
+                f"{result_message or '상세 메시지 없음'}"
             )
 
         return response_root.get("body", {}) or {}
 
     @staticmethod
+    def _extract_error_message(text: str) -> str:
+        """XML 또는 텍스트 오류 응답에서 안전한 메시지만 추출합니다."""
+
+        cleaned = (text or "").strip()
+
+        if not cleaned:
+            return "응답 내용 없음"
+
+        try:
+            root = ET.fromstring(cleaned)
+
+            candidates = (
+                "returnAuthMsg",
+                "errMsg",
+                "resultMsg",
+                "cmmMsgHeader",
+                "returnReasonCode",
+            )
+
+            parts: list[str] = []
+
+            for tag in candidates:
+                element = root.find(f".//{tag}")
+                if (
+                    element is not None
+                    and element.text
+                    and element.text.strip()
+                ):
+                    parts.append(element.text.strip())
+
+            if parts:
+                return " / ".join(dict.fromkeys(parts))
+        except ET.ParseError:
+            pass
+
+        # 인증키 등 민감한 쿼리스트링은 응답 본문에 포함되지 않지만,
+        # 화면이 과도하게 길어지지 않도록 일부만 표시합니다.
+        one_line = " ".join(cleaned.split())
+        return one_line[:220]
+
+    @staticmethod
     def _items(body: dict[str, Any]) -> list[dict[str, Any]]:
         items_wrapper = body.get("items") or {}
-        item = items_wrapper.get("item") if isinstance(items_wrapper, dict) else []
+
+        item = (
+            items_wrapper.get("item")
+            if isinstance(items_wrapper, dict)
+            else []
+        )
 
         if item is None:
             return []
+
         if isinstance(item, list):
-            return [row for row in item if isinstance(row, dict)]
+            return [
+                row
+                for row in item
+                if isinstance(row, dict)
+            ]
+
         if isinstance(item, dict):
             return [item]
+
         return []
 
     def get_city_codes(self) -> list[dict[str, str]]:
@@ -102,6 +218,7 @@ class TagoClient:
                 or row.get("cityCode")
                 or ""
             ).strip()
+
             city_name = str(
                 row.get("cityname")
                 or row.get("cityName")
@@ -127,6 +244,7 @@ class TagoClient:
             "getCtyAcctoTrainSttnList",
             {"cityCode": city_code},
         )
+
         result: list[dict[str, str]] = []
 
         for row in self._items(body):
@@ -135,6 +253,7 @@ class TagoClient:
                 or row.get("nodeId")
                 or ""
             ).strip()
+
             station_name = str(
                 row.get("nodename")
                 or row.get("nodeName")
@@ -157,29 +276,40 @@ class TagoClient:
         cities = self.get_city_codes()
         stations: dict[str, dict[str, str]] = {}
 
+        if not cities:
+            raise TagoAPIError(
+                "TAGO에서 도시코드 목록을 받지 못했습니다. "
+                "인증키 승인 상태를 확인하세요."
+            )
+
         for city in cities:
             rows = self.get_stations_by_city(
                 city_code=city["city_code"],
                 city_name=city["city_name"],
             )
+
             for row in rows:
                 stations[row["station_id"]] = row
 
         if not stations:
             raise TagoAPIError(
-                "공식 역 목록이 비어 있습니다. "
+                "TAGO에서 공식 역 목록을 받지 못했습니다. "
                 "인증키 승인 상태와 API 응답을 확인하세요."
             )
 
-        # 같은 역명이 여러 지역에 있을 때만 지역명을 표시합니다.
         name_counts: dict[str, int] = {}
-        for row in stations.values():
-            name = row["station_name"]
-            name_counts[name] = name_counts.get(name, 0) + 1
 
-        result = []
+        for row in stations.values():
+            station_name = row["station_name"]
+            name_counts[station_name] = (
+                name_counts.get(station_name, 0) + 1
+            )
+
+        result: list[dict[str, str]] = []
+
         for row in stations.values():
             display_name = row["station_name"]
+
             if name_counts[row["station_name"]] > 1:
                 display_name = (
                     f"{row['station_name']} · {row['city_name']}"
@@ -226,6 +356,7 @@ class TagoClient:
                 or row.get("depPlandTime")
                 or ""
             ).strip()
+
             arrival_raw = str(
                 row.get("arrplandtime")
                 or row.get("arrPlandTime")
@@ -269,11 +400,18 @@ class TagoClient:
                 }
             )
 
-        return sorted(result, key=lambda row: row["departure_dt"])
+        return sorted(
+            result,
+            key=lambda row: row["departure_dt"],
+        )
 
     @staticmethod
     def _parse_datetime(value: str) -> datetime | None:
-        digits = "".join(character for character in value if character.isdigit())
+        digits = "".join(
+            character
+            for character in value
+            if character.isdigit()
+        )
 
         for fmt, length in (
             ("%Y%m%d%H%M%S", 14),
@@ -281,7 +419,10 @@ class TagoClient:
         ):
             if len(digits) >= length:
                 try:
-                    return datetime.strptime(digits[:length], fmt)
+                    return datetime.strptime(
+                        digits[:length],
+                        fmt,
+                    )
                 except ValueError:
                     continue
 
@@ -292,6 +433,9 @@ class TagoClient:
         try:
             if value is None or value == "":
                 return None
-            return int(str(value).replace(",", ""))
+
+            return int(
+                str(value).replace(",", "")
+            )
         except (TypeError, ValueError):
             return None

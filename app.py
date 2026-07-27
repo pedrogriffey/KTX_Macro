@@ -759,131 +759,130 @@ else:
         ),
     )
 
-selected_interval = int(
-    selected_saved_job.get(
-        "check_interval_seconds"
+    selected_interval = int(
+        selected_saved_job.get(
+            "check_interval_seconds"
+        )
+        or 0
     )
-    or 0
-)
 
-if selected_saved_status == "active":
-    if st.button(
-        "백그라운드 일시정지",
-        use_container_width=True,
-    ):
-        try:
-            pause_monitor_job(
-                supabase_client,
-                job_id=selected_saved_job_id,
+    if selected_saved_status == "active":
+        if st.button(
+            "백그라운드 일시정지",
+            use_container_width=True,
+        ):
+            try:
+                pause_monitor_job(
+                    supabase_client,
+                    job_id=selected_saved_job_id,
+                )
+            except MonitorJobError as exc:
+                st.error(str(exc))
+            else:
+                st.success("작업을 일시정지했습니다.")
+                st.rerun()
+    else:
+        if selected_interval < 30:
+            st.warning(
+                "현재 작업은 30초보다 짧아 실제 페이지 확인을 시작할 수 없습니다. "
+                "30초 이상 조회 간격의 작업을 새로 저장하세요."
             )
-        except MonitorJobError as exc:
-            st.error(str(exc))
-        else:
-            st.success("작업을 일시정지했습니다.")
-            st.rerun()
-else:
-    if selected_interval < 30:
-        st.warning(
-            "현재 작업은 30초보다 짧아 실제 페이지 확인을 시작할 수 없습니다. "
-            "30초 이상 조회 간격의 작업을 새로 저장하세요."
+
+        if st.button(
+            "실제 잔여석 모니터링 시작",
+            type="primary",
+            use_container_width=True,
+            disabled=(
+                not st.session_state.telegram_chat_id
+                or worker_health.get("is_online") is not True
+                or selected_interval < 30
+            ),
+        ):
+            try:
+                activate_monitor_job_live(
+                    supabase_client,
+                    job_id=selected_saved_job_id,
+                )
+            except MonitorJobError as exc:
+                st.error(str(exc))
+            else:
+                st.success(
+                    "코레일 공개 예매페이지 잔여석 모니터링을 시작했습니다."
+                )
+                st.rerun()
+
+        if st.button(
+            "연습용 백그라운드 테스트 시작",
+            use_container_width=True,
+            disabled=(
+                not st.session_state.telegram_chat_id
+                or worker_health.get("is_online") is not True
+            ),
+        ):
+            try:
+                activate_monitor_job_test(
+                    supabase_client,
+                    job_id=selected_saved_job_id,
+                    available_after_checks=(
+                        simulation_available_after
+                    ),
+                )
+            except MonitorJobError as exc:
+                st.error(str(exc))
+            else:
+                st.success(
+                    "연습용 백그라운드 테스트를 시작했습니다."
+                )
+                st.rerun()
+
+    manage_col1, manage_col2 = st.columns(2)
+
+    with manage_col1:
+        if st.button(
+            "준비 상태로 초기화",
+            use_container_width=True,
+            disabled=(
+                selected_saved_status == "active"
+            ),
+        ):
+            try:
+                reset_monitor_job(
+                    supabase_client,
+                    job_id=selected_saved_job_id,
+                )
+            except MonitorJobError as exc:
+                st.error(str(exc))
+            else:
+                st.success(
+                    "작업을 준비 상태로 초기화했습니다."
+                )
+                st.rerun()
+
+    with manage_col2:
+        delete_confirmed = st.checkbox(
+            "삭제 확인",
+            key=f"delete_confirm_{selected_saved_job_id}",
         )
 
-    if st.button(
-        "실제 잔여석 모니터링 시작",
-        type="primary",
-        use_container_width=True,
-        disabled=(
-            not st.session_state.telegram_chat_id
-            or worker_health.get("is_online") is not True
-            or selected_interval < 30
-        ),
-    ):
-        try:
-            activate_monitor_job_live(
-                supabase_client,
-                job_id=selected_saved_job_id,
-            )
-        except MonitorJobError as exc:
-            st.error(str(exc))
-        else:
-            st.success(
-                "코레일 공개 예매페이지 잔여석 모니터링을 시작했습니다."
-            )
-            st.rerun()
-
-    if st.button(
-        "연습용 백그라운드 테스트 시작",
-        use_container_width=True,
-        disabled=(
-            not st.session_state.telegram_chat_id
-            or worker_health.get("is_online") is not True
-        ),
-    ):
-        try:
-            activate_monitor_job_test(
-                supabase_client,
-                job_id=selected_saved_job_id,
-                available_after_checks=(
-                    simulation_available_after
-                ),
-            )
-        except MonitorJobError as exc:
-            st.error(str(exc))
-        else:
-            st.success(
-                "연습용 백그라운드 테스트를 시작했습니다."
-            )
-            st.rerun()
-
-manage_col1, manage_col2 = st.columns(2)
-
-with manage_col1:
-    if st.button(
-        "준비 상태로 초기화",
-        use_container_width=True,
-        disabled=(
-            selected_saved_status == "active"
-        ),
-    ):
-        try:
-            reset_monitor_job(
-                supabase_client,
-                job_id=selected_saved_job_id,
-            )
-        except MonitorJobError as exc:
-            st.error(str(exc))
-        else:
-            st.success(
-                "작업을 준비 상태로 초기화했습니다."
-            )
-            st.rerun()
-
-with manage_col2:
-    delete_confirmed = st.checkbox(
-        "삭제 확인",
-        key=f"delete_confirm_{selected_saved_job_id}",
-    )
-
-    if st.button(
-        "선택 작업 삭제",
-        use_container_width=True,
-        disabled=(
-            not delete_confirmed
-            or selected_saved_status == "active"
-        ),
-    ):
-        try:
-            delete_monitor_job(
-                supabase_client,
-                user_id=user_id,
-                job_id=selected_saved_job_id,
-            )
-        except MonitorJobError as exc:
-            st.error(str(exc))
-        else:
-            st.success("저장 작업을 삭제했습니다.")
-            st.rerun()
-
+        if st.button(
+            "선택 작업 삭제",
+            use_container_width=True,
+            disabled=(
+                not delete_confirmed
+                or selected_saved_status == "active"
+            ),
+        ):
+            try:
+                delete_monitor_job(
+                    supabase_client,
+                    user_id=user_id,
+                    job_id=selected_saved_job_id,
+                )
+            except MonitorJobError as exc:
+                st.error(str(exc))
+            else:
+                st.success("저장 작업을 삭제했습니다.")
+                st.rerun()
     st.caption(
         "실제 잔여석 확인은 코레일 공개 예매페이지를 최소 30초 간격으로 "
         "확인합니다. 연습용 테스트는 3초부터 가능합니다."

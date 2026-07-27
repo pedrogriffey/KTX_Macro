@@ -7,6 +7,9 @@ from provider_contract import (
 from korail_official_provider import (
     KorailOfficialSeatProvider,
 )
+from korail_web_provider import (
+    KorailWebSeatProvider,
+)
 from simulation_provider import (
     SimulationSeatProvider,
 )
@@ -17,6 +20,7 @@ def get_provider(
 ) -> SeatProvider:
     providers: dict[str, SeatProvider] = {
         "simulation": SimulationSeatProvider(),
+        "korail_web": KorailWebSeatProvider(),
         "korail_official": KorailOfficialSeatProvider(),
     }
 

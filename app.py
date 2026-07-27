@@ -20,6 +20,7 @@ from supabase_auth import (
 )
 from monitor_jobs_service import (
     MonitorJobError,
+    activate_monitor_job_live,
     activate_monitor_job_test,
     create_monitor_job,
     delete_monitor_job,
@@ -212,7 +213,7 @@ except SupabaseAuthError as exc:
 # 6. 로그인 화면
 # =========================================================
 st.title("🚄 KTX 빈자리 모니터")
-st.caption("8A 단계 · 공식 좌석 공급자 준비 및 운영 안전장치")
+st.caption("10A 단계 · 코레일 공개페이지 잔여석 확인")
 
 if auth_user is None:
     st.info(
@@ -404,43 +405,43 @@ simulation_status = provider_by_name.get(
     "simulation",
     {},
 )
-official_status = provider_by_name.get(
-    "korail_official",
+web_status = provider_by_name.get(
+    "korail_web",
     {},
 )
 
 if simulation_status.get("is_enabled") is True:
-    st.success(
-        "연습용 시뮬레이션 공급자 사용 가능"
-    )
+    st.success("연습용 시뮬레이션 사용 가능")
 
-if official_status.get("is_enabled") is True:
+if web_status.get("is_enabled") is True:
     st.success(
-        "코레일 공식 잔여좌석 공급자 연결 완료"
+        "코레일 공개 예매페이지 잔여석 확인 기능 사용 가능"
     )
 else:
     st.warning(
-        "실제 코레일 잔여좌석 공급자는 아직 연결되지 않았습니다. "
-        "공식 API 또는 제휴 승인을 받은 뒤 활성화합니다."
+        "코레일 공개 예매페이지 확인 기능이 비활성 상태입니다."
     )
 
 st.caption(
     str(
-        official_status.get("public_message")
-        or "현재 실제 좌석 여부는 제공하지 않습니다."
+        web_status.get("public_message")
+        or "공개 예매페이지의 일반실·특실 표시를 확인합니다."
     )
 )
 
+with st.expander("실제 페이지 조회 기준"):
+    st.write(
+        "- 코레일 로그인정보를 수집하지 않습니다.\n"
+        "- 예약·결제 버튼을 실행하지 않습니다.\n"
+        "- 실제 페이지 조회 간격은 최소 30초입니다.\n"
+        "- 접속제한 또는 추가 확인 화면이 나오면 우회하지 않고 재시도합니다.\n"
+        "- 3초 조회는 연습용 시뮬레이션에만 사용합니다."
+    )
+
 st.link_button(
     "코레일 공식 예매 페이지 열기",
-    "https://www.letskorail.com/",
+    "https://www.korail.com/ticket/search",
     use_container_width=True,
-)
-
-st.info(
-    "공개 서비스에서는 비공식 내부 API, 로그인 자동화, "
-    "CAPTCHA 우회 또는 반복 웹 스크래핑을 사용하지 않습니다. "
-    "3초 조회 간격은 현재 시뮬레이션 Worker 검증에만 적용됩니다."
 )
 
 
@@ -632,6 +633,9 @@ SEAT_CLASS_LABELS = {
 RESULT_LABELS = {
     "simulation_sold_out": "연습용 매진",
     "simulation_available": "연습용 빈자리 발견",
+    "korail_web_sold_out": "실제 페이지 매진",
+    "korail_web_available": "실제 페이지 좌석 있음",
+    "provider_temporary_error": "페이지 일시 오류·재시도 예정",
     "train_departed": "열차 출발시간 경과",
 }
 
@@ -668,10 +672,13 @@ else:
                 "간격": (
                     f"{job.get('check_interval_seconds', '-')}초"
                 ),
-                "공급자": (
-                    "연습용"
-                    if str(job.get("provider", "")) == "simulation"
-                    else str(job.get("provider") or "-")
+                "공급자": {
+                    "simulation": "연습용",
+                    "korail_web": "코레일 공개페이지",
+                    "korail_official": "공식 API",
+                }.get(
+                    str(job.get("provider", "")),
+                    str(job.get("provider") or "-"),
                 ),
                 "조회": (
                     f"{job.get('worker_check_count', 0)}회"
@@ -752,101 +759,134 @@ else:
         ),
     )
 
-    action_col1, action_col2, action_col3 = st.columns(3)
+selected_interval = int(
+    selected_saved_job.get(
+        "check_interval_seconds"
+    )
+    or 0
+)
 
-    with action_col1:
-        if selected_saved_status == "active":
-            if st.button(
-                "백그라운드 일시정지",
-                use_container_width=True,
-            ):
-                try:
-                    pause_monitor_job(
-                        supabase_client,
-                        job_id=selected_saved_job_id,
-                    )
-                except MonitorJobError as exc:
-                    st.error(str(exc))
-                else:
-                    st.success("작업을 일시정지했습니다.")
-                    st.rerun()
+if selected_saved_status == "active":
+    if st.button(
+        "백그라운드 일시정지",
+        use_container_width=True,
+    ):
+        try:
+            pause_monitor_job(
+                supabase_client,
+                job_id=selected_saved_job_id,
+            )
+        except MonitorJobError as exc:
+            st.error(str(exc))
         else:
-            if st.button(
-                "백그라운드 테스트 시작",
-                type="primary",
-                use_container_width=True,
-                disabled=(
-                    not st.session_state.telegram_chat_id
-                    or worker_health.get("is_online") is not True
-                ),
-            ):
-                try:
-                    activate_monitor_job_test(
-                        supabase_client,
-                        job_id=selected_saved_job_id,
-                        available_after_checks=(
-                            simulation_available_after
-                        ),
-                    )
-                except MonitorJobError as exc:
-                    st.error(str(exc))
-                else:
-                    st.success(
-                        "백그라운드 테스트를 시작했습니다. "
-                        "이제 브라우저를 닫아도 Worker가 계속 실행합니다."
-                    )
-                    st.rerun()
-
-    with action_col2:
-        if st.button(
-            "준비 상태로 초기화",
-            use_container_width=True,
-            disabled=(
-                selected_saved_status == "active"
-            ),
-        ):
-            try:
-                reset_monitor_job(
-                    supabase_client,
-                    job_id=selected_saved_job_id,
-                )
-            except MonitorJobError as exc:
-                st.error(str(exc))
-            else:
-                st.success(
-                    "작업을 준비 상태로 초기화했습니다."
-                )
-                st.rerun()
-
-    with action_col3:
-        delete_confirmed = st.checkbox(
-            "삭제 확인",
-            key=f"delete_confirm_{selected_saved_job_id}",
+            st.success("작업을 일시정지했습니다.")
+            st.rerun()
+else:
+    if selected_interval < 30:
+        st.warning(
+            "현재 작업은 30초보다 짧아 실제 페이지 확인을 시작할 수 없습니다. "
+            "30초 이상 조회 간격의 작업을 새로 저장하세요."
         )
 
-        if st.button(
-            "선택 작업 삭제",
-            use_container_width=True,
-            disabled=(
-                not delete_confirmed
-                or selected_saved_status == "active"
-            ),
-        ):
-            try:
-                delete_monitor_job(
-                    supabase_client,
-                    user_id=user_id,
-                    job_id=selected_saved_job_id,
-                )
-            except MonitorJobError as exc:
-                st.error(str(exc))
-            else:
-                st.success("저장 작업을 삭제했습니다.")
-                st.rerun()
+    if st.button(
+        "실제 잔여석 모니터링 시작",
+        type="primary",
+        use_container_width=True,
+        disabled=(
+            not st.session_state.telegram_chat_id
+            or worker_health.get("is_online") is not True
+            or selected_interval < 30
+        ),
+    ):
+        try:
+            activate_monitor_job_live(
+                supabase_client,
+                job_id=selected_saved_job_id,
+            )
+        except MonitorJobError as exc:
+            st.error(str(exc))
+        else:
+            st.success(
+                "코레일 공개 예매페이지 잔여석 모니터링을 시작했습니다."
+            )
+            st.rerun()
+
+    if st.button(
+        "연습용 백그라운드 테스트 시작",
+        use_container_width=True,
+        disabled=(
+            not st.session_state.telegram_chat_id
+            or worker_health.get("is_online") is not True
+        ),
+    ):
+        try:
+            activate_monitor_job_test(
+                supabase_client,
+                job_id=selected_saved_job_id,
+                available_after_checks=(
+                    simulation_available_after
+                ),
+            )
+        except MonitorJobError as exc:
+            st.error(str(exc))
+        else:
+            st.success(
+                "연습용 백그라운드 테스트를 시작했습니다."
+            )
+            st.rerun()
+
+manage_col1, manage_col2 = st.columns(2)
+
+with manage_col1:
+    if st.button(
+        "준비 상태로 초기화",
+        use_container_width=True,
+        disabled=(
+            selected_saved_status == "active"
+        ),
+    ):
+        try:
+            reset_monitor_job(
+                supabase_client,
+                job_id=selected_saved_job_id,
+            )
+        except MonitorJobError as exc:
+            st.error(str(exc))
+        else:
+            st.success(
+                "작업을 준비 상태로 초기화했습니다."
+            )
+            st.rerun()
+
+with manage_col2:
+    delete_confirmed = st.checkbox(
+        "삭제 확인",
+        key=f"delete_confirm_{selected_saved_job_id}",
+    )
+
+    if st.button(
+        "선택 작업 삭제",
+        use_container_width=True,
+        disabled=(
+            not delete_confirmed
+            or selected_saved_status == "active"
+        ),
+    ):
+        try:
+            delete_monitor_job(
+                supabase_client,
+                user_id=user_id,
+                job_id=selected_saved_job_id,
+            )
+        except MonitorJobError as exc:
+            st.error(str(exc))
+        else:
+            st.success("저장 작업을 삭제했습니다.")
+            st.rerun()
 
     st.caption(
-        "현재 Worker는 실제 코레일 좌석이 아니라 연습용 상태를 조회합니다. "
-        "조회 간격은 저장한 3초 이상의 값을 그대로 사용합니다."
+        "실제 잔여석 확인은 코레일 공개 예매페이지를 최소 30초 간격으로 "
+        "확인합니다. 연습용 테스트는 3초부터 가능합니다."
     )
 
     try:
@@ -1277,9 +1317,8 @@ if st.session_state.selected_train:
             ),
             disabled=st.session_state.monitor_active,
             help=(
-                "저장 가능한 최소 조회 간격은 3초입니다. "
-                "실제 Worker 운영 시 서비스 부하와 외부 서비스 정책에 따라 "
-                "더 긴 간격이 적용될 수 있습니다."
+                "3~15초는 연습용 테스트에 사용할 수 있습니다. "
+                "실제 코레일 페이지 모니터링은 30초 이상 간격의 작업만 가능합니다."
             ),
         )
 
@@ -1571,11 +1610,15 @@ with st.expander("현재 공개 서비스 준비 상태"):
         "- 좌석 공급자 교체형 구조\n"
         "- 사용자당 활성 작업 최대 3개\n"
         "- 백그라운드 실행 감사 로그\n"
-        "- 공식 좌석 API 승인 전 실제 공급자 비활성화\n\n"
-        "다음 단계는 코레일 또는 승인된 제휴사의 공식 잔여좌석 API "
-        "계약이 확보된 뒤 실제 공급자 구현을 진행합니다."
+        "- 코레일 공개 예매페이지 표시 기반 잔여석 확인\n"
+        "- 실제 페이지 최소 조회 간격 30초\n"
+        "- 사용자당 실제 활성 작업 최대 1개\n"
+        "- 로그인·예약·결제 기능 미사용\n\n"
+        "다음 단계에서는 실제 페이지 결과를 열차 카드 형태로 표시하고 "
+        "여러 열차를 한 번에 선택하는 화면을 추가합니다."
     )
 
 st.caption(
-    "현재 실제 잔여좌석 조회 및 자동예매 기능은 포함하지 않습니다."
+    "코레일 공개 예매페이지의 예약 가능·매진 표시만 확인하며 "
+    "자동예매·결제 기능은 포함하지 않습니다."
 )

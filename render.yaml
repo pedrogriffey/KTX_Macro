@@ -1,10 +1,9 @@
 services:
   - type: worker
     name: ktx-seat-monitor-worker
-    runtime: python
+    runtime: docker
     plan: starter
-    buildCommand: pip install -r requirements-worker.txt
-    startCommand: python worker.py
+    dockerfilePath: ./Dockerfile
     autoDeploy: true
     envVars:
       - key: SUPABASE_URL
@@ -19,5 +18,9 @@ services:
         value: "20"
       - key: WORKER_HEARTBEAT_SECONDS
         value: "15"
+      - key: KORAIL_SEARCH_URL
+        value: "https://www.korail.com/ticket/search"
+      - key: KORAIL_BROWSER_TIMEOUT_MS
+        value: "30000"
       - key: LOG_LEVEL
         value: "INFO"

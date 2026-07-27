@@ -11,6 +11,7 @@ from typing import Any
 
 from provider_contract import (
     SeatAvailability,
+    SeatProviderTemporaryError,
     SeatProviderUnavailableError,
 )
 from provider_registry import get_provider
@@ -21,7 +22,7 @@ from worker_rest_client import (
 )
 
 
-WORKER_VERSION = "8A.2"
+WORKER_VERSION = "10A.1-no9A"
 STOP_REQUESTED = False
 
 
@@ -98,6 +99,28 @@ def build_alert_message(
         str(job.get("seat_class", "")),
     )
 
+    provider_name = str(
+        job.get("provider") or "simulation"
+    )
+
+    if provider_name == "korail_web":
+        return (
+            "🚨 KTX 잔여좌석 발견\n\n"
+            f"구간: "
+            f"{job.get('departure_station_name', '')}"
+            f" → "
+            f"{job.get('arrival_station_name', '')}\n"
+            f"열차: {job.get('train_type', '')} "
+            f"{job.get('train_no', '')}\n"
+            f"출발: {job.get('departure_planned_at', '')}\n"
+            f"좌석 조건: {seat_label}\n"
+            f"확인 횟수: {check_count}회\n\n"
+            "코레일 공개 승차권 예매페이지에서 "
+            "예약 가능 표시를 확인했습니다.\n"
+            "실제 예매 시점에는 좌석상태가 달라질 수 있습니다.\n"
+            "https://www.korail.com/ticket/search"
+        )
+
     return (
         "🚨 KTX 백그라운드 빈자리 발견 테스트\n\n"
         f"구간: "
@@ -108,10 +131,8 @@ def build_alert_message(
         f"{job.get('train_no', '')}\n"
         f"출발: {job.get('departure_planned_at', '')}\n"
         f"좌석 조건: {seat_label}\n"
-        f"백그라운드 조회 횟수: {check_count}회\n\n"
-        "브라우저를 닫은 상태에서도 Worker가 실행됐습니다.\n"
-        "현재 좌석 발견 결과는 실제 코레일 재고가 아닌 "
-        "연습용 시뮬레이션입니다."
+        f"조회 횟수: {check_count}회\n\n"
+        "현재 좌석 발견 결과는 연습용 시뮬레이션입니다."
     )
 
 
@@ -247,9 +268,7 @@ def process_job(
                 "alert_sent_at": iso_utc(
                     checked_at
                 ),
-                "completed_reason": (
-                    "simulation_available"
-                ),
+                "completed_reason": result.result_code,
                 "next_check_at": None,
                 "locked_at": None,
                 "lock_token": None,
@@ -278,8 +297,14 @@ def process_job(
         )
         return
 
+    minimum_interval = (
+        30
+        if str(job.get("provider") or "") == "korail_web"
+        else 3
+    )
+
     interval = max(
-        3,
+        minimum_interval,
         min(
             int(
                 job.get(
@@ -334,9 +359,70 @@ def process_job(
     )
 
     logging.info(
-        "매진 시뮬레이션 완료: %s, 다음 조회 %s초 후",
+        "좌석 미발견: %s | provider=%s | 다음 조회 %s초 후",
         job_id,
+        result.provider_name,
         interval,
+    )
+
+
+
+def reschedule_temporary_provider_error(
+    api: SupabaseWorkerClient,
+    worker_id: str,
+    job: dict[str, Any],
+    error: Exception,
+) -> None:
+    job_id = str(job.get("id", ""))
+    lock_token = str(job.get("lock_token", ""))
+
+    if not job_id or lock_token != worker_id:
+        return
+
+    current_interval = int(
+        job.get("check_interval_seconds") or 30
+    )
+
+    retry_seconds = max(
+        60,
+        min(
+            current_interval * 2,
+            600,
+        ),
+    )
+
+    next_check_at = (
+        utc_now()
+        + timedelta(seconds=retry_seconds)
+    )
+
+    api.insert_monitor_event(
+        {
+            "job_id": job_id,
+            "user_id": str(job.get("user_id", "")),
+            "event_type": "provider_temporary_error",
+            "provider": str(job.get("provider") or ""),
+            "result_code": "provider_temporary_error",
+            "detail": {
+                "message": str(error)[:600],
+                "retry_seconds": retry_seconds,
+            },
+        }
+    )
+
+    api.update_job(
+        job_id,
+        lock_token,
+        {
+            "status": "active",
+            "is_enabled": True,
+            "last_error": str(error)[:800],
+            "last_result": "provider_temporary_error",
+            "next_check_at": iso_utc(next_check_at),
+            "locked_at": None,
+            "lock_token": None,
+            "worker_version": WORKER_VERSION,
+        },
     )
 
 
@@ -548,11 +634,36 @@ def main() -> int:
                     worker_id=worker_id,
                     job=job,
                 )
+            except SeatProviderTemporaryError as exc:
+                logging.warning(
+                    "좌석 공급자 일시 오류: %s | %s",
+                    job.get("id"),
+                    exc,
+                )
+
+                try:
+                    reschedule_temporary_provider_error(
+                        api=api,
+                        worker_id=worker_id,
+                        job=job,
+                        error=exc,
+                    )
+                except WorkerAPIError:
+                    logging.exception(
+                        "공급자 일시 오류 재예약 실패"
+                    )
+                    mark_job_error(
+                        api,
+                        worker_id,
+                        job,
+                        exc,
+                    )
             except SeatProviderUnavailableError as exc:
                 logging.error(
-                    "공식 좌석 공급자 미연결: %s",
+                    "좌석 공급자 사용 불가: %s",
                     job.get("id"),
                 )
+
                 try:
                     api.insert_monitor_event(
                         {
@@ -572,6 +683,7 @@ def main() -> int:
                     logging.exception(
                         "공급자 오류 이벤트 저장 실패"
                     )
+
                 mark_job_error(
                     api,
                     worker_id,
@@ -604,7 +716,6 @@ def main() -> int:
                     job,
                     exc,
                 )
-
     logging.info("KTX Worker 종료")
     return 0
 

@@ -345,6 +345,14 @@ def _friendly_rpc_error(
             "작업을 찾지 못",
             "작업을 찾지 못했거나 더 이상 실행할 수 없습니다.",
         ),
+        (
+            "실제 페이지 조회 간격",
+            "실제 코레일 페이지 조회는 30초 이상 작업만 시작할 수 있습니다.",
+        ),
+        (
+            "실제 좌석 작업은 최대 1개",
+            "실제 잔여석 모니터링은 사용자당 동시에 1개만 실행할 수 있습니다.",
+        ),
     )
 
     for keyword, friendly in mappings:
@@ -414,3 +422,25 @@ def list_monitor_events(
         for row in rows
         if isinstance(row, dict)
     ]
+
+
+
+def activate_monitor_job_live(
+    client: Client,
+    *,
+    job_id: str,
+) -> None:
+    try:
+        client.rpc(
+            "activate_monitor_job_live",
+            {
+                "p_job_id": job_id,
+            },
+        ).execute()
+    except Exception as exc:
+        raise MonitorJobError(
+            _friendly_rpc_error(
+                exc,
+                "실제 잔여석 모니터링을 시작하지 못했습니다.",
+            )
+        ) from exc

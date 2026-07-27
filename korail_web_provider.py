@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import os
 import re
+import threading
+import time
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
@@ -22,6 +24,12 @@ from provider_contract import (
 
 
 KST = ZoneInfo("Asia/Seoul")
+
+_CACHE_LOCK = threading.Lock()
+_RESULT_CACHE: dict[
+    tuple[str, str, str, str, str, str],
+    tuple[float, SeatCheckResult],
+] = {}
 
 
 class KorailWebSeatProvider:
@@ -61,6 +69,19 @@ class KorailWebSeatProvider:
             ),
         )
 
+        self.shared_cache_seconds = max(
+            3,
+            min(
+                int(
+                    os.getenv(
+                        "KORAIL_SHARED_CACHE_SECONDS",
+                        "30",
+                    )
+                ),
+                300,
+            ),
+        )
+
     def check(
         self,
         job: dict[str, Any],
@@ -68,6 +89,29 @@ class KorailWebSeatProvider:
         next_count = int(
             job.get("worker_check_count") or 0
         ) + 1
+
+        cache_key = self._cache_key(job)
+        now_monotonic = time.monotonic()
+
+        with _CACHE_LOCK:
+            cached = _RESULT_CACHE.get(cache_key)
+
+        if cached is not None:
+            cached_at, cached_result = cached
+            cache_age = now_monotonic - cached_at
+
+            if cache_age < self.shared_cache_seconds:
+                return SeatCheckResult(
+                    availability=cached_result.availability,
+                    result_code=cached_result.result_code,
+                    detail=(
+                        f"{cached_result.detail} "
+                        f"(열차별 공유 캐시 {cache_age:.1f}초)"
+                    ),
+                    next_check_count=next_count,
+                    provider_name=self.name,
+                    observed_at=cached_result.observed_at,
+                )
 
         try:
             with sync_playwright() as playwright:
@@ -77,13 +121,21 @@ class KorailWebSeatProvider:
                 )
 
                 try:
-                    return self._check_with_browser(
+                    result = self._check_with_browser(
                         browser=browser,
                         job=job,
                         next_count=next_count,
                     )
                 finally:
                     browser.close()
+
+            with _CACHE_LOCK:
+                _RESULT_CACHE[cache_key] = (
+                    time.monotonic(),
+                    result,
+                )
+
+            return result
 
         except SeatProviderTemporaryError:
             raise
@@ -213,6 +265,19 @@ class KorailWebSeatProvider:
 
         finally:
             context.close()
+
+    @staticmethod
+    def _cache_key(
+        job: dict[str, Any],
+    ) -> tuple[str, str, str, str, str, str]:
+        return (
+            str(job.get("departure_station_id") or ""),
+            str(job.get("arrival_station_id") or ""),
+            str(job.get("travel_date") or ""),
+            str(job.get("train_no") or ""),
+            str(job.get("departure_planned_at") or ""),
+            str(job.get("seat_class") or "any"),
+        )
 
     def _fill_station(
         self,

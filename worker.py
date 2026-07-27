@@ -22,7 +22,7 @@ from worker_rest_client import (
 )
 
 
-WORKER_VERSION = "10A.1-no9A"
+WORKER_VERSION = "10A.2-no9A"
 STOP_REQUESTED = False
 
 
@@ -297,11 +297,7 @@ def process_job(
         )
         return
 
-    minimum_interval = (
-        30
-        if str(job.get("provider") or "") == "korail_web"
-        else 3
-    )
+    minimum_interval = 3
 
     interval = max(
         minimum_interval,

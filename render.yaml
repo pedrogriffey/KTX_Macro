@@ -22,5 +22,7 @@ services:
         value: "https://www.korail.com/ticket/search"
       - key: KORAIL_BROWSER_TIMEOUT_MS
         value: "30000"
+      - key: KORAIL_SHARED_CACHE_SECONDS
+        value: "30"
       - key: LOG_LEVEL
         value: "INFO"
